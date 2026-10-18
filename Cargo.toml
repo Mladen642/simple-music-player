@@ -1,0 +1,37 @@
+[package]
+name = "music-player"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.91"
+description = "A music player for your own music folder: covers, timed lyrics, favorites, statistics, downloads and 13 themes"
+license = "MIT"
+readme = "README.md"
+keywords = ["music", "player", "lyrics", "egui", "appimage"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+dirs = "7.0.0"
+ebur128 = "0.1.10"
+eframe = { version = "0.33.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui-phosphor = { version = "0.11.0", features = ["regular", "fill"] }
+fastrand = "2.5.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+indexmap = "2"
+lofty = "0.25.4"
+regex = "1.13.1"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-flac", "symphonia-vorbis", "symphonia-wav", "symphonia-aac", "symphonia-isomp4"] }
+rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha1_smol = "1.0.1"
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+trash = "5.2.9"
+unicode-normalization = "0.1.25"
+ureq = { version = "2", features = ["json"] }
+zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 16      # builds faster; the app is plenty fast either way
+strip = true

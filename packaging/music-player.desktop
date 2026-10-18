@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Music Player
+Comment=Your music with covers, favorites, statistics and themes
+Exec=music-player
+Icon=music-player
+Categories=AudioVideo;Audio;Player;
+Terminal=false
+StartupWMClass=music-player
