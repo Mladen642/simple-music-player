@@ -110,9 +110,6 @@ left out by default:
 `MUSIC_PLAYER_TEST_MP3=song.mp3 MUSIC_PLAYER_TEST_AUDIO=song.m4a cargo test --release -- --ignored`
 (the download test also needs yt-dlp and ffmpeg). `MP_DEBUG=1` prints startup steps.
 
-GitHub Actions builds and tests every push. Pushing a tag like `v1.0.0` makes a
-release with the AppImage attached.
-
 ## The code
 
 | File | What it does |
