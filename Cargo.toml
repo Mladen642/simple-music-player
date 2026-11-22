@@ -1,7 +1,13 @@
 [package]
 name = "music-player"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2024"
+rust-version = "1.91"
+description = "A music player for your own music folder: covers, timed lyrics, favorites, statistics, downloads and 13 themes"
+license = "MIT"
+readme = "README.md"
+keywords = ["music", "player", "lyrics", "egui", "appimage"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 dirs = "7.0.0"

@@ -285,51 +285,43 @@ pub fn cancel(running: &Running) {
 
 #[cfg(test)]
 mod tests {
-    // Songs served by a local web server: checked, downloaded, named and tagged. An
-    // .m4a and an .mp3 are kept as they are; an .opus (which the player can't play) is
-    // made into an mp3. (Runs only when the tools are in /tmp/rt/data4/bin)
+    // A song served by a local web server: checked, downloaded, named and tagged. An
+    // .m4a or .mp3 is kept as it is (not converted); any other kind becomes an mp3.
+    // Needs yt-dlp and ffmpeg on the PATH, python3, and an audio file:
+    //   MUSIC_PLAYER_TEST_AUDIO=some.m4a cargo test -- --ignored
     #[test]
+    #[ignore]
     fn a_download() {
-        let tools = super::Tools::find(std::path::Path::new("/tmp/rt/data4"));
-        if !tools.ready() || !std::path::Path::new("/tmp/rt/dlsrc").exists() {
-            return;
-        }
-        let mut server = std::process::Command::new("python3").args(["-m", "http.server", "8899", "-d", "/tmp/rt/dlsrc"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let audio = std::path::PathBuf::from(std::env::var("MUSIC_PLAYER_TEST_AUDIO").expect("MUSIC_PLAYER_TEST_AUDIO"));
+        let tools = super::Tools::find(&std::env::temp_dir().join("no-own-tools"));
+        assert!(tools.ready(), "yt-dlp and ffmpeg are needed on the PATH");
+        let dir = audio.parent().unwrap().to_string_lossy().to_string();
+        let mut server = std::process::Command::new("python3").args(["-m", "http.server", "8899", "-d", &dir])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(800));
-        let out = std::path::Path::new("/tmp/rt/dlout");
-        let _ = std::fs::remove_dir_all(out);
-        std::fs::create_dir_all(out).unwrap();
-        let mut results = Vec::new();
-        for (source, title) in [("song.m4a", "Test Song (Official Video)"), ("song.mp3", "Second Song"), ("song.opus", "Third Song"), ("song.m4a", "Second Song")] {
-            if !std::path::Path::new("/tmp/rt/dlsrc").join(source).exists() {
-                continue;
-            }
-            let (playlist, mut entries) = super::check(&tools, &format!("http://127.0.0.1:8899/{source}")).unwrap();
-            println!("playlist {playlist:?}, entries: {:?}", entries.iter().map(|e| (&e.artist, &e.title)).collect::<Vec<_>>());
-            entries[0].artist = "Test Artist".into();
-            entries[0].title = title.into();
-            let running = super::Running::default();
-            let seen = std::sync::Mutex::new(Vec::new());
-            let state = super::download(&tools, out, 0, &entries[0], &running, &|s| seen.lock().unwrap().push(format!("{s:?}")));
-            println!("{source}: {state:?}, states: {:?}", seen.lock().unwrap());
-            let converted = seen.lock().unwrap().iter().any(|s| s == "Converting");
-            results.push((source, state.clone(), converted));
-            if let super::State::Done(name) = state {
-                let (tags, duration, _) = crate::library::read_tags(&out.join(&name));
-                assert_eq!((tags.artist.as_str(), tags.title.as_str()), ("Test Artist", title));
-                assert!(duration > 5.0);
-                assert!(rodio::Decoder::try_from(std::fs::File::open(out.join(&name)).unwrap()).is_ok(), "{name} plays");
-            }
-        }
+        let link = format!("http://127.0.0.1:8899/{}", audio.file_name().unwrap().to_string_lossy());
+        let (_, mut entries) = super::check(&tools, &link).unwrap();
+        entries[0].artist = "Test Artist".into();
+        entries[0].title = "Test Song (Official Video)".into();
+        let out = std::env::temp_dir().join("download-test");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let first = super::download(&tools, &out, 0, &entries[0], &super::Running::default(), &|s| seen.lock().unwrap().push(s));
+        // Once more: the name is never used twice
+        let second = super::download(&tools, &out, 1, &entries[0], &super::Running::default(), &|_| {});
         server.kill().unwrap();
-        let done = |name: &str| super::State::Done(name.into());
-        // m4a and mp3 as they were (not converted); the name is never used twice, whatever the kind
-        assert_eq!(results[0], ("song.m4a", done("Test Artist - Test Song.m4a"), false));
-        assert_eq!(results[1], ("song.mp3", done("Test Artist - Second Song.mp3"), false));
-        assert_eq!(results[2], ("song.opus", done("Test Artist - Third Song.mp3"), true));
-        assert_eq!(results[3], ("song.m4a", done("Test Artist - Second Song (2).m4a"), false));
-        let mut files: Vec<String> = std::fs::read_dir(out).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
-        files.sort();
-        assert_eq!(files.len(), 4, "leftovers: {files:?}");
+        let kind = audio.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let kept = super::SAVED_AS.contains(&kind.as_str());
+        let saved_as = if kept { kind.as_str() } else { "mp3" };
+        assert_eq!(first, super::State::Done(format!("Test Artist - Test Song.{saved_as}")));
+        assert_eq!(second, super::State::Done(format!("Test Artist - Test Song (2).{saved_as}")));
+        assert_eq!(seen.lock().unwrap().contains(&super::State::Converting), !kept, "converted only when it has to be");
+        let file = out.join(format!("Test Artist - Test Song.{saved_as}"));
+        let (tags, duration, _) = crate::library::read_tags(&file);
+        assert_eq!((tags.artist.as_str(), tags.title.as_str()), ("Test Artist", "Test Song (Official Video)"));
+        assert!(duration > 0.0);
+        assert!(rodio::Decoder::try_from(std::fs::File::open(&file).unwrap()).is_ok(), "the player can play it");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2, "nothing left over");
     }
 }

@@ -83,23 +83,19 @@ pub fn import(data: &Path, from: &Path) -> Result<String, String> {
 mod tests {
     #[test]
     fn there_and_back() {
-        let old = std::path::Path::new("/tmp/oldplayer");
-        if !old.join("library.json").exists() {
-            return;
-        }
+        let old = crate::store::tests::sample_library("export-test-old");
         let (a, b) = (std::env::temp_dir().join("export-a"), std::env::temp_dir().join("export-b"));
         let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        crate::store::import_old_player(old, &a).unwrap();
+        crate::store::import_old_player(&old, &a).unwrap();
         let zip = std::env::temp_dir().join("library-test.zip");
-        let count = super::export(&a, &zip).unwrap();
-        assert!(count > 10, "{count}");
+        assert_eq!(super::export(&a, &zip).unwrap(), 4); // library, settings, a cover, lyrics
         std::fs::write(b.join("library.json"), "{\"songs\": {}}").unwrap(); // something to back up
         let message = super::import(&b, &zip).unwrap();
-        assert!(message.contains("652 songs"), "{message}");
+        assert!(message.contains("2 songs"), "{message}");
         assert_eq!(std::fs::read(a.join("library.json")).unwrap(), std::fs::read(b.join("library.json")).unwrap());
-        assert_eq!(std::fs::read_dir(a.join("covers")).unwrap().count(), std::fs::read_dir(b.join("covers")).unwrap().count());
-        assert!(std::fs::read_dir(b.join("backups")).unwrap().count() == 1);
+        assert!(b.join("covers/abc.jpg").exists() && b.join("lyrics/Band - Song.lrc").exists());
+        assert_eq!(std::fs::read_dir(b.join("backups")).unwrap().count(), 1);
     }
 }

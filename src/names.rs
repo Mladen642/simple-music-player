@@ -364,22 +364,3 @@ mod tests {
         assert_eq!(names("Song (Instrumental).mp3").1, "Song (Instrumental)");
     }
 }
-
-#[cfg(test)]
-mod compare {
-    // Writes the names of /tmp/names-in.json (a list of file names) to /tmp/names-rust.json,
-    // to compare with the web version's (run only when that file is there)
-    #[test]
-    fn names_of_a_real_library() {
-        let Ok(text) = std::fs::read_to_string("/tmp/names-in.json") else { return };
-        let files: Vec<String> = serde_json::from_str(&text).unwrap();
-        let names: Vec<[String; 3]> = files
-            .iter()
-            .map(|file| {
-                let n = super::natural_names(&super::Names::default(), file);
-                [n.artist, n.title, n.album]
-            })
-            .collect();
-        std::fs::write("/tmp/names-rust.json", serde_json::to_string(&names).unwrap()).unwrap();
-    }
-}

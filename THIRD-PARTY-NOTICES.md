@@ -24,9 +24,11 @@ folder. They are not part of this repository or the AppImage:
 The app looks things up on these services, only with song, artist and album names:
 
 - Covers: iTunes Search (Apple), Deezer, MusicBrainz and the Cover Art Archive
-- Lyrics: LRCLIB, lrcmux (YouTube Music, Genius, KuGou) and NetEase Cloud Music
-  (its public web API, unofficial)
-- Albums and genres: Wikipedia
+- Lyrics: LRCLIB, lrcmux (YouTube Music, Genius, KuGou), NetEase Cloud Music (its
+  public web API, unofficial) and Tekstovi.net (it has no lookup service, so its
+  public pages are read: the artist list, the artist's songs, then the song's page;
+  only when the other sources have nothing, and once per song)
+- Albums and genres: Wikipedia (English, Serbian, Croatian, Bosnian, Serbo-Croatian)
 
 Downloading music is meant for music you're allowed to download. Please respect the
 terms of the sites you use and the rights of the artists.

@@ -912,28 +912,31 @@ mod remembering {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Lyrics inside a song file are found before anything online (when the test files
-    // ffmpeg made are in /tmp/rt: mp3s with plain and with timed lyrics, an m4a, a flac)
+    // Lyrics inside a song file are found before anything online. Needs an mp3 (it's
+    // copied, never changed):
+    //   MUSIC_PLAYER_TEST_MP3=some.mp3 cargo test -- --ignored
     #[test]
+    #[ignore]
     fn lyrics_inside_the_file() {
-        let source = Path::new("/tmp/rt");
-        if !source.join("plain-lyrics.mp3").exists() {
-            return;
-        }
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, Tag};
+        let source = std::fs::read(std::env::var("MUSIC_PLAYER_TEST_MP3").expect("MUSIC_PLAYER_TEST_MP3")).unwrap();
         let dir = std::env::temp_dir().join(format!("lyrics-inside-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (file, text, timed) in [
-            ("plain-lyrics.mp3", "First line\nSecond line", false),
-            ("timed-lyrics.mp3", "[00:01.00] One\n[00:02.00] Two\n[00:03.00] Three", true),
-            ("lyrics.m4a", "In an m4a\nSecond", false),
-            ("lyrics.flac", "In a flac\nSecond", false),
-        ] {
-            let query = Query { path: source.join(file), ..query(&dir) };
+        let query = query(&dir);
+        for (text, timed) in [("First line\nSecond line", false), ("[00:01.00] One\n[00:02.00] Two\n[00:03.00] Three", true)] {
+            std::fs::write(&query.path, &source).unwrap();
+            let mut file = lofty::read_from_path(&query.path).unwrap();
+            file.clear();
+            assert!(embedded(&query.path).is_none() || file.save_to_path(&query.path, lofty::config::WriteOptions::default()).is_ok());
+            let mut tag = Tag::new(file.primary_tag_type());
+            assert!(tag.insert_text(ItemKey::UnsyncLyrics, text.to_string()), "mp3 tags keep lyrics under this name");
+            file.insert_tag(tag);
+            file.save_to_path(&query.path, lofty::config::WriteOptions::default()).unwrap();
             let found = find(&query, None, false);
-            assert_eq!((found.source.as_str(), found.synced.is_some(), found.plain.is_some()), ("tags", timed, !timed), "{file}");
+            assert_eq!((found.source.as_str(), found.synced.is_some(), found.plain.is_some()), ("tags", timed, !timed));
             assert_eq!(found.plain.or(found.synced).unwrap(), text);
         }
-        assert!(embedded(&source.join("tiny.mp3")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

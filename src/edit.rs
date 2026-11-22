@@ -122,9 +122,12 @@ mod tests {
         assert_eq!(file_name_for("song.mp3", "Song (Official Video)", UNKNOWN_ARTIST), "Song.mp3");
     }
 
+    // Needs an mp3 (it's copied, never changed):
+    //   MUSIC_PLAYER_TEST_MP3=some.mp3 cargo test -- --ignored
     #[test]
+    #[ignore]
     fn tags_go_into_the_file() {
-        let Ok(source) = std::fs::read("/tmp/rt/tiny.mp3") else { return };
+        let source = std::fs::read(std::env::var("MUSIC_PLAYER_TEST_MP3").expect("MUSIC_PLAYER_TEST_MP3")).unwrap();
         let path = std::env::temp_dir().join("tag-test.mp3");
         std::fs::write(&path, source).unwrap();
         let wanted = Names { title: "Title".into(), artist: "Artist".into(), album: "".into(), genre: "Rock, Pop".into() };
