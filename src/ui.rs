@@ -595,8 +595,9 @@ fn favorites_card(app: &mut App, ui: &mut Ui, t: &Theme) {
             return;
         }
         let mut play = None;
-        egui::ScrollArea::vertical().id_salt("favorites").auto_shrink([false, false]).show(ui, |ui| {
-            for (id, title, artist) in &favorites {
+        // (only the rows in view are drawn)
+        egui::ScrollArea::vertical().id_salt("favorites").auto_shrink([false, false]).show_rows(ui, 50.0, favorites.len(), |ui, range| {
+            for (id, title, artist) in &favorites[range] {
                 let here = app.song(id).is_some();
                 if here {
                     app.request_cover(id, false);
@@ -687,8 +688,8 @@ fn stats_card(app: &mut App, ui: &mut Ui, t: &Theme) {
         let active = if by_genre { app.genre_filter.clone() } else { app.artist_filter.clone() };
         let moving = app.player.is_playing();
         let mut clicked = None;
-        egui::ScrollArea::vertical().id_salt("bars").auto_shrink([false, false]).show(ui, |ui| {
-            for bar in bars {
+        egui::ScrollArea::vertical().id_salt("bars").auto_shrink([false, false]).show_rows(ui, 38.0, bars.len(), |ui, range| {
+            for bar in &bars[range] {
                 let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
                 let painter = ui.painter();
                 let is_active = active.as_deref() == Some(bar.key.as_str());
@@ -1780,7 +1781,7 @@ fn download_window(app: &mut App, ctx: &egui::Context, t: &Theme) {
             ui.set_width(600.0);
             let tools = app.downloads.tools.clone();
             if !tools.ready() {
-                ui.label(RichText::new("Downloads need three free programs: yt-dlp (finds the music), ffmpeg (makes mp3s) and deno (reads YouTube's pages). \
+                ui.label(RichText::new("Downloads need three free programs: yt-dlp (finds the music), ffmpeg (puts the sound into its file) and deno (reads YouTube's pages). \
                     They're downloaded once into the player's folder (about 250 MB).").color(t.muted));
                 ui.add_space(8.0);
                 if app.downloads.getting_tools {
@@ -1792,7 +1793,7 @@ fn download_window(app: &mut App, ctx: &egui::Context, t: &Theme) {
                     app.get_download_tools();
                 }
             } else {
-                ui.label(RichText::new("Paste a link to a song or a playlist (YouTube, SoundCloud, Bandcamp and many more). Songs are saved into the open folder as \"Artist - Title.mp3\".").color(t.muted));
+                ui.label(RichText::new("Paste a link to a song or a playlist (YouTube, SoundCloud, Bandcamp and many more). Songs are saved into the open folder as \"Artist - Title\", as .m4a or .mp3 (the sound as the site has it, not converted).").color(t.muted));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let field = egui::TextEdit::singleline(&mut app.downloads.link).hint_text("https://…").desired_width(470.0).font(regular(14.5)).margin(vec2(10.0, 8.0));
@@ -1823,7 +1824,11 @@ fn download_window(app: &mut App, ctx: &egui::Context, t: &Theme) {
                             ui.checkbox(&mut entry.chosen, "");
                             ui.add(egui::TextEdit::singleline(&mut entry.artist).hint_text("Artist").desired_width(200.0));
                             ui.label(RichText::new("–").color(t.muted));
-                            ui.add(egui::TextEdit::singleline(&mut entry.title).hint_text("Title").desired_width(300.0));
+                            ui.add(egui::TextEdit::singleline(&mut entry.title).hint_text("Title").desired_width(if entry.have { 215.0 } else { 300.0 }));
+                            if entry.have {
+                                ui.label(RichText::new("you have it").font(regular(12.0)).color(t.warning))
+                                    .on_hover_text("A song with this artist and title is in your library already. Tick it to download it anyway.");
+                            }
                         });
                     }
                 });

@@ -266,9 +266,52 @@ pub fn simplify(text: &str) -> String {
     text.to_lowercase().replace('đ', "d").nfkd().filter(|c| c.is_alphanumeric()).collect()
 }
 
-// True when one name contains the other, ignoring case, accents and punctuation
+// Serbian Cyrillic in Latin letters ("Рибља чорба" -> "Riblja čorba"), so a name
+// written either way is the same name. Other text stays as it is.
+pub fn to_latin(text: &str) -> String {
+    if !text.chars().any(|c| ('\u{400}'..='\u{4ff}').contains(&c)) {
+        return text.to_string();
+    }
+    const LETTERS: [(char, &str); 30] = [
+        ('а', "a"), ('б', "b"), ('в', "v"), ('г', "g"), ('д', "d"), ('ђ', "đ"), ('е', "e"), ('ж', "ž"), ('з', "z"), ('и', "i"),
+        ('ј', "j"), ('к', "k"), ('л', "l"), ('љ', "lj"), ('м', "m"), ('н', "n"), ('њ', "nj"), ('о', "o"), ('п', "p"), ('р', "r"),
+        ('с', "s"), ('т', "t"), ('ћ', "ć"), ('у', "u"), ('ф', "f"), ('х', "h"), ('ц', "c"), ('ч', "č"), ('џ', "dž"), ('ш', "š"),
+    ];
+    let mut latin = String::with_capacity(text.len());
+    for c in text.chars() {
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        match LETTERS.iter().find(|(cyrillic, _)| *cyrillic == lower) {
+            Some((_, letters)) if c.is_uppercase() => {
+                // "Љ" -> "Lj"
+                let mut letters = letters.chars();
+                latin.extend(letters.next().into_iter().flat_map(char::to_uppercase));
+                latin.extend(letters);
+            }
+            Some((_, letters)) => latin.push_str(letters),
+            None => latin.push(c),
+        }
+    }
+    latin
+}
+
+// Without accents, keeping upper and lower case ("Noćni Voz" -> "Nocni Voz", "Đorđe" ->
+// "Dorde"): how many lyrics libraries spell Serbian, Croatian and Bosnian names
+pub fn without_accents(text: &str) -> String {
+    to_latin(text)
+        .nfd()
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .map(|c| match c {
+            'đ' => 'd',
+            'Đ' => 'D',
+            other => other,
+        })
+        .collect()
+}
+
+// True when one name contains the other, ignoring case, accents, punctuation and
+// whether it's in Cyrillic or Latin letters
 pub fn same_name(a: &str, b: &str) -> bool {
-    let simple = |text: &str| normalize(text).chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    let simple = |text: &str| normalize(&to_latin(text)).chars().filter(|c| c.is_alphanumeric()).collect::<String>();
     let (x, y) = (simple(a), simple(b));
     !x.is_empty() && !y.is_empty() && (x.contains(&y) || y.contains(&x))
 }
@@ -319,5 +362,24 @@ mod tests {
         assert_eq!(names("99 Problems.mp3").1, "99 Problems");
         assert_eq!(names("Jay-Z - Encore.mp3").0, "Jay-Z");
         assert_eq!(names("Song (Instrumental).mp3").1, "Song (Instrumental)");
+    }
+}
+
+#[cfg(test)]
+mod compare {
+    // Writes the names of /tmp/names-in.json (a list of file names) to /tmp/names-rust.json,
+    // to compare with the web version's (run only when that file is there)
+    #[test]
+    fn names_of_a_real_library() {
+        let Ok(text) = std::fs::read_to_string("/tmp/names-in.json") else { return };
+        let files: Vec<String> = serde_json::from_str(&text).unwrap();
+        let names: Vec<[String; 3]> = files
+            .iter()
+            .map(|file| {
+                let n = super::natural_names(&super::Names::default(), file);
+                [n.artist, n.title, n.album]
+            })
+            .collect();
+        std::fs::write("/tmp/names-rust.json", serde_json::to_string(&names).unwrap()).unwrap();
     }
 }

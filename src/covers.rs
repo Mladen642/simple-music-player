@@ -82,9 +82,8 @@ impl Covers {
             let request = line.take();
             let bytes = embedded_picture(&request.path).or_else(|| request.folder_image.as_ref().and_then(|p| std::fs::read(p).ok()));
             match bytes.as_deref().and_then(|bytes| decode(bytes, request.big)) {
-                Some((big, small)) => {
-                    let backdrop = big.as_ref().map(|_| backdrop(bytes.as_deref().unwrap_or_default()));
-                    let _ = send_files.send(crate::app::Event::Cover(Cover { id: request.id, big, backdrop: backdrop.flatten(), small: Some(small) }));
+                Some((big, backdrop, small)) => {
+                    let _ = send_files.send(crate::app::Event::Cover(Cover { id: request.id, big, backdrop, small: Some(small) }));
                     wake_files();
                 }
                 None if !request.artist.is_empty() => next.push(request.clone(), request.big),
@@ -102,8 +101,7 @@ impl Covers {
                 let request = online.take();
                 let bytes = lookup.cover(&covers_dir, &request);
                 let decoded = bytes.as_deref().and_then(|bytes| decode(bytes, request.big));
-                let backdrop = if request.big { bytes.as_deref().and_then(backdrop) } else { None };
-                let (big, small) = decoded.map_or((None, None), |(big, small)| (big, Some(small)));
+                let (big, backdrop, small) = decoded.map_or((None, None, None), |(big, backdrop, small)| (big, backdrop, Some(small)));
                 let _ = send.send(crate::app::Event::Cover(Cover { id: request.id, big, backdrop, small }));
                 wake();
             }
@@ -126,9 +124,11 @@ fn embedded_picture(path: &Path) -> Option<Vec<u8>> {
     Some(picture.data().to_vec())
 }
 
-// The picture at two sizes (the big one only when asked for), cut to a square
-fn decode(bytes: &[u8], want_big: bool) -> Option<(Option<ColorImage>, ColorImage)> {
+// The picture at two sizes, cut to a square; the big one and the backdrop only when asked
+// for (the song that's playing). The file is unpacked once for all of them.
+fn decode(bytes: &[u8], want_big: bool) -> Option<(Option<ColorImage>, Option<ColorImage>, ColorImage)> {
     let image = image::load_from_memory(bytes).ok()?;
+    let backdrop = want_big.then(|| backdrop(&image));
     let side = image.width().min(image.height());
     let square = image.crop_imm((image.width() - side) / 2, (image.height() - side) / 2, side, side);
     let to_color = |img: image::DynamicImage| {
@@ -137,15 +137,14 @@ fn decode(bytes: &[u8], want_big: bool) -> Option<(Option<ColorImage>, ColorImag
     };
     let big = want_big.then(|| to_color(if side > BIG { square.resize_exact(BIG, BIG, image::imageops::FilterType::Lanczos3) } else { square.clone() }));
     let small = to_color(square.resize_exact(SMALL, SMALL, image::imageops::FilterType::Triangle));
-    Some((big, small))
+    Some((big, backdrop, small))
 }
 
 // The cover shrunk to 48 pixels and blurred: stretched over the window, it becomes a
 // soft wash of its colors (egui can't blur on screen, so it's done once, here)
-fn backdrop(bytes: &[u8]) -> Option<ColorImage> {
-    let image = image::load_from_memory(bytes).ok()?;
+fn backdrop(image: &image::DynamicImage) -> ColorImage {
     let small = image.resize_exact(48, 48, image::imageops::FilterType::Triangle).blur(5.0).to_rgba8();
-    Some(ColorImage::from_rgba_unmultiplied([48, 48], small.as_raw()))
+    ColorImage::from_rgba_unmultiplied([48, 48], small.as_raw())
 }
 
 // ---------- Online ----------
@@ -158,8 +157,11 @@ struct Lookup {
 
 const USER_AGENT: &str = "SimpleMusicPlayer/2.0 (personal music player)";
 
+// One agent for all lookups, so connections to a source are kept open and used again
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).user_agent(USER_AGENT).build()
+    static AGENT: std::sync::LazyLock<ureq::Agent> =
+        std::sync::LazyLock::new(|| ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).user_agent(USER_AGENT).build());
+    AGENT.clone()
 }
 
 fn get_json(url: &str, query: &[(&str, &str)]) -> Result<Value, String> {

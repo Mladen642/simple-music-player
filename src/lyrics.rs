@@ -1,25 +1,33 @@
 // Lyrics. Where they come from, in this order ("Best match"):
 //   1. a .lrc file next to the song,
 //   2. the lyrics folder (lyrics you saved),
-//   3. LRCLIB, a free lyrics library,
-//   4. lrcmux, a free service that asks YouTube Music, Genius, KuGou and LRCLIB at once,
-//   5. NetEase Cloud Music, which has timed lyrics for a great many songs.
+//   3. lyrics stored inside the song file (its tags),
+//   4. LRCLIB, a free lyrics library,
+//   5. lrcmux, a free service that asks YouTube Music, Genius, KuGou and LRCLIB at once,
+//   6. NetEase Cloud Music, which has timed lyrics for a great many songs,
+//   7. Tekstovi.net (songs from Serbia, Croatia, Bosnia...), when the others have nothing.
+// 4 to 6 are asked at the same time, and the best answer in that order is used. What was
+// found online is remembered in the lyrics-cache folder (and "nothing found" for 30
+// days), so a song is only looked up once.
 // Timed lyrics win over plain text, even those of a slightly different version of the
 // song (the timing buttons line them up). Names are tried several ways, since lyrics
 // libraries often spell them differently than the tags do. The menu above the lyrics picks one source instead;
 // that choice is kept per song in library.json.
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
-pub const SOURCES: [(&str, &str); 7] = [
+pub const SOURCES: [(&str, &str); 9] = [
     ("lrc", ".lrc file"),
     ("saved", "Lyrics folder"),
+    ("tags", "In the song file"),
     ("lrclib", "LRCLIB"),
     ("ytmusic", "YouTube Music"), // these three are asked through lrcmux
     ("genius", "Genius"),
     ("kugou", "KuGou"),
     ("netease", "NetEase"),
+    ("tekstovi", "Tekstovi.net"),
 ];
 
 pub fn source_name(id: &str) -> String {
@@ -48,6 +56,7 @@ impl Found {
 pub struct Query {
     pub path: PathBuf,
     pub lyrics_dir: PathBuf,
+    pub cache_dir: PathBuf, // what was found online before
     pub file_name: String, // "Artist - Title", for the lyrics folder
     pub artist: String,    // empty when unknown
     pub title: String,
@@ -55,13 +64,16 @@ pub struct Query {
     pub duration: f32,
 }
 
-// The song's own lyrics first, then online (choice: a source picked for this song)
-pub fn find(query: &Query, choice: Option<&str>) -> Found {
-    // Lyrics on this computer always win: a .lrc next to the song or saved ones (the one
-    // picked for this song first, when it's one of these two), never replaced by online ones
+// The song's own lyrics first, then online (choice: a source picked for this song).
+// fresh: ask online again even when an answer is remembered.
+pub fn find(query: &Query, choice: Option<&str>, fresh: bool) -> Found {
+    // Lyrics on this computer always win: a .lrc next to the song, saved ones or ones
+    // inside the file (the one picked for this song first, when it's one of these),
+    // never replaced by online ones
     let local = match choice {
-        Some("saved") => ["saved", "lrc"],
-        _ => ["lrc", "saved"],
+        Some("saved") => ["saved", "lrc", "tags"],
+        Some("tags") => ["tags", "lrc", "saved"],
+        _ => ["lrc", "saved", "tags"],
     };
     for id in local {
         if let Ok(Some(found)) = from_source(query, id) {
@@ -69,35 +81,162 @@ pub fn find(query: &Query, choice: Option<&str>) -> Found {
         }
     }
     if let Some(choice) = choice.filter(|c| !local.contains(c)) {
-        if let Ok(Some(found)) = from_source(query, choice) {
-            if found.has_lyrics() {
-                return found;
+        let picked = remembered(query, choice, fresh, || match from_source(query, choice) {
+            Ok(found) => Online { found: found.filter(Found::has_lyrics), reached_all: true, reached_any: true },
+            Err(error) => {
+                eprintln!("Lyrics from {choice}: {error}");
+                Online::default()
             }
+        });
+        if let Some(found) = picked.found {
+            return found;
         }
     }
-    let mut fallback: Option<Found> = None;
-    let mut reached_any = false;
-    for id in ["lrclib", "best", "netease"] {
-        // "best": lrcmux picks from all its sources
-        match from_source(query, id) {
-            Ok(found) => {
-                reached_any = true;
-                if let Some(found) = found {
-                    if (found.synced.is_some() && !found.other_version) || found.message.is_some() {
-                        return found; // timed lyrics, or "Instrumental"
-                    }
-                    if fallback.as_ref().is_none_or(|f| rank(&found) > rank(f)) {
-                        fallback = Some(found);
-                    }
-                }
-            }
-            Err(error) => eprintln!("Lyrics from {id}: {error}"),
-        }
-    }
-    fallback.unwrap_or_else(|| Found {
-        message: Some(if reached_any { "No lyrics found for this song.".into() } else { "Couldn't reach the lyrics services. Check your internet connection.".into() }),
+    let online = remembered(query, "best", fresh, || best_online(query));
+    online.found.unwrap_or_else(|| Found {
+        message: Some(if online.reached_any { "No lyrics found for this song.".into() } else { "Couldn't reach the lyrics services. Check your internet connection.".into() }),
         ..Default::default()
     })
+}
+
+// What asking online came to
+#[derive(Default)]
+struct Online {
+    found: Option<Found>,
+    reached_all: bool, // every source answered: "nothing" can be remembered
+    reached_any: bool,
+}
+
+// LRCLIB, lrcmux ("best": it picks from all its sources) and NetEase, all asked at the
+// same time. The answer used is the one asking them one after another would give:
+// the first in that order with timed lyrics (or "Instrumental"), otherwise the best of
+// the rest. It's returned as soon as that's settled, without waiting for slower sources.
+fn best_online(query: &Query) -> Online {
+    const ORDER: [&str; 3] = ["lrclib", "best", "netease"];
+    let (send, receive) = std::sync::mpsc::channel();
+    for (index, id) in ORDER.into_iter().enumerate() {
+        let (query, send) = (query.clone(), send.clone());
+        std::thread::spawn(move || {
+            let _ = send.send((index, from_source(&query, id)));
+        });
+    }
+    drop(send);
+    let wins = |found: &Found| (found.synced.is_some() && !found.other_version) || found.message.is_some();
+    let mut answers: [Option<Result<Option<Found>, String>>; 3] = [None, None, None];
+    loop {
+        // Settled when a winner has no unanswered source before it
+        for answer in &answers {
+            match answer {
+                None => break,
+                Some(Ok(Some(found))) if wins(found) => return Online { found: Some(found.clone()), reached_all: true, reached_any: true },
+                Some(_) => {}
+            }
+        }
+        match receive.recv() {
+            Ok((index, answer)) => {
+                if let Err(error) = &answer {
+                    eprintln!("Lyrics from {}: {error}", ORDER[index]);
+                }
+                answers[index] = Some(answer);
+            }
+            Err(_) => break, // all of them answered
+        }
+    }
+    let mut online = Online {
+        found: None,
+        reached_all: answers.iter().all(|answer| matches!(answer, Some(Ok(_)))),
+        reached_any: answers.iter().any(|answer| matches!(answer, Some(Ok(_)))),
+    };
+    for found in answers.into_iter().flatten().filter_map(|answer| answer.ok().flatten()) {
+        if online.found.as_ref().is_none_or(|best| rank(&found) > rank(best)) {
+            online.found = Some(found);
+        }
+    }
+    // Nothing anywhere: songs from Serbia, Croatia, Bosnia... are often only on Tekstovi.net
+    if online.found.is_none() {
+        match tekstovi(query) {
+            Ok(found) => {
+                online.reached_any = true;
+                online.found = found;
+            }
+            Err(error) => {
+                eprintln!("Lyrics from tekstovi: {error}");
+                online.reached_all = false;
+            }
+        }
+    }
+    online
+}
+
+// ---------- Remembering what was found online ----------
+
+const ASK_AGAIN: u64 = 30 * 24 * 3600; // seconds: "nothing found" and second-best finds are asked again after 30 days
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+// The file an answer is kept in. Songs are told apart by artist, title and length (a
+// live version has its own lyrics timing); kind: "best", or the source picked for the song.
+fn cache_file(query: &Query, kind: &str) -> PathBuf {
+    let key = format!("{}|{}|{}", crate::names::simplify(&query.artist), crate::names::simplify(&query.title), query.duration.round() as i64);
+    let name = &sha1_smol::Sha1::from(key.as_bytes()).digest().to_string()[..16];
+    query.cache_dir.join(format!("{name}-{kind}.json"))
+}
+
+// The remembered answer: Some(None) is "nothing found" (asked not long ago)
+fn read_cache(file: &Path) -> Option<Option<Found>> {
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    let recent = now().saturating_sub(value.get("checked").and_then(Value::as_u64)?) < ASK_AGAIN;
+    if value.get("missing").and_then(Value::as_bool) == Some(true) {
+        return recent.then_some(None);
+    }
+    let found = Found {
+        synced: text(&value, "synced"),
+        plain: text(&value, "plain"),
+        message: text(&value, "message"),
+        source: text(&value, "source").unwrap_or_default(),
+        source_name: text(&value, "sourceName").unwrap_or_default(),
+        saved: false,
+        other_version: value.get("otherVersion").and_then(Value::as_bool).unwrap_or(false),
+    };
+    if !found.has_lyrics() {
+        return None;
+    }
+    // Timed lyrics of this very song are kept for good; anything less may get better
+    let best_there_is = found.synced.is_some() && !found.other_version;
+    (best_there_is || recent).then_some(Some(found))
+}
+
+fn write_cache(file: &Path, query: &Query, found: Option<&Found>) {
+    let value = match found {
+        Some(found) => serde_json::json!({
+            "artist": query.artist, "title": query.title, "checked": now(),
+            "source": found.source, "sourceName": found.source_name, "otherVersion": found.other_version,
+            "synced": found.synced, "plain": found.plain, "message": found.message,
+        }),
+        None => serde_json::json!({ "artist": query.artist, "title": query.title, "checked": now(), "missing": true }),
+    };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = crate::store::write_safely(file, &serde_json::to_string_pretty(&value).unwrap_or_default());
+}
+
+// The remembered answer, or a new one (which is then remembered: lyrics always, "nothing
+// found" only when every source could be reached, so a bad connection isn't mistaken for it)
+fn remembered(query: &Query, kind: &str, fresh: bool, ask: impl FnOnce() -> Online) -> Online {
+    let file = cache_file(query, kind);
+    if !fresh {
+        if let Some(found) = read_cache(&file) {
+            return Online { found, reached_all: true, reached_any: true };
+        }
+    }
+    let online = ask();
+    if online.found.is_some() || online.reached_all {
+        write_cache(&file, query, online.found.as_ref());
+    }
+    online
 }
 
 // Which of two finds is better: timed lyrics (even of another version) over plain text
@@ -111,9 +250,10 @@ fn rank(found: &Found) -> u8 {
 }
 
 // The ways to ask for a song, best first: as named, then the first artist alone
-// ("A & B", "A feat. B" -> "A") and the title without "(Live)" or "feat. X"
+// ("A & B", "A feat. B" -> "A") and the title without "(Live)" or "feat. X", then the
+// same without accents ("Noćni voz" -> "Nocni voz", Cyrillic in Latin letters), the way
+// many libraries spell songs from Serbia, Croatia and Bosnia
 pub fn variants(artist: &str, title: &str) -> Vec<(String, String)> {
-    use std::sync::LazyLock;
     static MORE_ARTISTS: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"(?i)\s*(?:&|,|\+|\bx\b|\band\b|\bvs\.?|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s.*$").unwrap());
     let first_artist = MORE_ARTISTS.replace(artist, "").trim().to_string();
@@ -122,6 +262,9 @@ pub fn variants(artist: &str, title: &str) -> Vec<(String, String)> {
     if !first_artist.is_empty() && first_artist != artist {
         list.push((first_artist.clone(), simple_title.clone()));
     }
+    let main_artist = if first_artist.is_empty() { artist } else { &first_artist };
+    list.push((crate::names::to_latin(main_artist), crate::names::to_latin(&simple_title)));
+    list.push((crate::names::without_accents(main_artist), crate::names::without_accents(&simple_title)));
     let mut unique = Vec::new();
     for pair in list {
         if !unique.contains(&pair) {
@@ -142,10 +285,51 @@ pub fn from_source(query: &Query, id: &str) -> Result<Option<Found>, String> {
             ..Default::default()
         })),
         "saved" => Ok(saved(query)),
+        "tags" => Ok(embedded(&query.path)),
         "lrclib" => lrclib(query),
         "netease" => netease(query),
-        _ => lrcmux(query, if id == "best" { "" } else { id }),
+        "tekstovi" => tekstovi(query),
+        _ => {
+            let provider = if id == "best" { "" } else { id };
+            match lrcmux(query, provider)? {
+                Some(found) => Ok(Some(found)),
+                // Once more without accents ("Đorđe Balašević" -> "Dorde Balasevic"), when that's another spelling
+                None => match plainly_spelled(query) {
+                    Some(plain) => lrcmux(&plain, provider),
+                    None => Ok(None),
+                },
+            }
+        }
     }
+}
+
+// The same song with its names in Latin letters without accents, if that's different
+fn plainly_spelled(query: &Query) -> Option<Query> {
+    let (artist, title) = (crate::names::without_accents(&query.artist), crate::names::without_accents(&query.title));
+    (artist != query.artist || title != query.title).then(|| Query { artist, title, ..query.clone() })
+}
+
+// Lyrics stored inside the song file (the tags of bought or carefully tagged songs
+// often have them): timed when they're written like a .lrc file, plain otherwise
+fn embedded(path: &Path) -> Option<Found> {
+    use lofty::file::TaggedFileExt;
+    let options = lofty::config::ParseOptions::new().read_cover_art(false).read_properties(false);
+    let file = lofty::probe::Probe::open(path).ok()?.options(options).guess_file_type().ok()?.read().ok()?;
+    // (mp3 tags keep them under another name than m4a, FLAC and Ogg tags do)
+    use lofty::tag::ItemKey;
+    let text = file.tags().iter().find_map(|tag| tag.get_string(ItemKey::Lyrics).or_else(|| tag.get_string(ItemKey::UnsyncLyrics)).map(str::to_string))?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n").trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let timed = parse_lrc(&text).iter().filter(|line| !line.text.is_empty()).count() >= 3;
+    Some(Found {
+        synced: timed.then(|| text.clone()),
+        plain: (!timed).then_some(text),
+        source: "tags".into(),
+        source_name: source_name("tags"),
+        ..Default::default()
+    })
 }
 
 fn saved(query: &Query) -> Option<Found> {
@@ -161,8 +345,15 @@ fn saved(query: &Query) -> Option<Found> {
     })
 }
 
+// One agent per waiting time (6, 8 and 10 seconds are used), each made once, so
+// connections to a source are kept open and used again
 fn agent(seconds: u64) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(Duration::from_secs(seconds)).user_agent("SimpleMusicPlayer/2.0").build()
+    static AGENTS: LazyLock<std::sync::Mutex<std::collections::HashMap<u64, ureq::Agent>>> = LazyLock::new(Default::default);
+    let mut agents = AGENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    agents
+        .entry(seconds)
+        .or_insert_with(|| ureq::AgentBuilder::new().timeout(Duration::from_secs(seconds)).user_agent("SimpleMusicPlayer/2.0").build())
+        .clone()
 }
 
 fn text(value: &Value, key: &str) -> Option<String> {
@@ -198,7 +389,14 @@ fn lrclib(query: &Query) -> Result<Option<Found>, String> {
         if duration > 0 {
             params.push(("duration", duration.to_string()));
         }
-        if let Some(item) = ask("get", &params)? {
+        let mut exact = ask("get", &params)?;
+        if exact.is_none() && !query.album.is_empty() {
+            // Album names in tags often differ from LRCLIB's: once more without it. (Any
+            // refusal here just means "not this way": the searches below come next.)
+            params.retain(|(key, _)| *key != "album_name");
+            exact = ask("get", &params).ok().flatten();
+        }
+        if let Some(item) = exact {
             let result = found(&item);
             if result.has_lyrics() {
                 return Ok(Some(result));
@@ -301,8 +499,9 @@ fn netease(query: &Query) -> Result<Option<Found>, String> {
 
 // NetEase starts lyrics with credits ("作词 : Someone"): those lines go
 fn without_credits(lrc: &str) -> String {
-    let credit = regex::Regex::new(r"^\s*(\[[^\]]*\])+\s*(作词|作曲|编曲|制作人|混音|母带|和声|吉他|贝斯|鼓|出品|发行|监制|录音)\s*[:：]").unwrap();
-    lrc.lines().filter(|line| !credit.is_match(line)).collect::<Vec<_>>().join("\n")
+    static CREDIT: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^\s*(\[[^\]]*\])+\s*(作词|作曲|编曲|制作人|混音|母带|和声|吉他|贝斯|鼓|出品|发行|监制|录音)\s*[:：]").unwrap());
+    lrc.lines().filter(|line| !CREDIT.is_match(line)).collect::<Vec<_>>().join("\n")
 }
 
 fn lrcmux(query: &Query, provider: &str) -> Result<Option<Found>, String> {
@@ -327,7 +526,9 @@ fn lrcmux(query: &Query, provider: &str) -> Result<Option<Found>, String> {
     }
     let answer: Value = match request.call() {
         Ok(response) => response.into_json().map_err(|e| e.to_string())?,
-        Err(ureq::Error::Status(_, _)) => return Ok(None), // not found (404) or too many requests (429)
+        // Busy (429) or broken (5xx) isn't "no lyrics": it's asked again another time
+        Err(ureq::Error::Status(code, _)) if code == 429 || code >= 500 => return Err(format!("lrcmux is busy ({code})")),
+        Err(ureq::Error::Status(_, _)) => return Ok(None), // not found
         Err(error) => return Err(error.to_string()),
     };
     let meta = answer.get("meta").cloned().unwrap_or(Value::Null);
@@ -355,6 +556,121 @@ fn lrcmux(query: &Query, provider: &str) -> Result<Option<Found>, String> {
         return Ok(Some(Found { synced: Some(synced), plain: Some(plain), ..base }));
     }
     Ok(Some(Found { plain: Some(plain), other_version: !same_length, ..base }))
+}
+
+// ---------- Tekstovi.net ----------
+
+// Tekstovi.net, a large collection of lyrics of songs from Serbia, Croatia, Bosnia and
+// their neighbours (plain text, no timing). It has no lookup service, so its pages are
+// read: the list of artists under the artist's first letter, the artist's list of
+// songs, then the song's page.
+fn tekstovi(query: &Query) -> Result<Option<Found>, String> {
+    tekstovi_at("https://tekstovi.net", query)
+}
+
+fn tekstovi_at(base: &str, query: &Query) -> Result<Option<Found>, String> {
+    if query.artist.is_empty() {
+        return Ok(None);
+    }
+    let simple = |text: &str| crate::names::simplify(&crate::names::to_latin(text));
+    let ways = variants(&query.artist, &query.title);
+    let artists: Vec<String> = ways.iter().map(|(artist, _)| simple(artist)).collect();
+    let titles: Vec<String> = ways.iter().map(|(_, title)| simple(title)).collect();
+
+    // The artist, in the list of its first letter ("0-9" is the page named "@")
+    // Č, Ć, Đ, Š and Ž have lists of their own: a name typed without accents ("Zeljko")
+    // may be under the accented letter
+    let latin = crate::names::to_latin(&query.artist);
+    let Some(first) = latin.chars().find(|c| c.is_alphanumeric()).and_then(|c| c.to_uppercase().next()) else { return Ok(None) };
+    let mut letters = vec![if first.is_ascii_digit() { '@' } else { first }];
+    letters.extend(match first {
+        'C' => vec!['Č', 'Ć'],
+        'D' => vec!['Đ'],
+        'S' => vec!['Š'],
+        'Z' => vec!['Ž'],
+        _ => Vec::new(),
+    });
+    let mut artist_id = None;
+    for letter in letters {
+        let index = tekstovi_page(&format!("{base}/2,{letter},0.html"), true)?;
+        artist_id = tekstovi_links(&index).into_iter().find(|(_, song, name)| song == "0" && artists.contains(&simple(name))).map(|(id, _, _)| id);
+        if artist_id.is_some() {
+            break;
+        }
+    }
+    let Some(artist_id) = artist_id else { return Ok(None) };
+    // The song, in the artist's list
+    let songs = tekstovi_page(&format!("{base}/2,{artist_id},0.html"), false)?;
+    let Some((_, song_id, _)) = tekstovi_links(&songs).into_iter().find(|(artist, song, name)| *artist == artist_id && song != "0" && titles.contains(&simple(name))) else {
+        return Ok(None);
+    };
+    let page = tekstovi_page(&format!("{base}/2,{artist_id},{song_id}.html"), false)?;
+    Ok(tekstovi_lyrics(&page).map(|plain| Found { plain: Some(plain), source: "tekstovi".into(), source_name: source_name("tekstovi"), ..Default::default() }))
+}
+
+// A page of the site. The lists of artists are kept while the player runs (one per
+// letter serves every song of every artist under it).
+fn tekstovi_page(url: &str, keep: bool) -> Result<String, String> {
+    static KEPT: LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = LazyLock::new(Default::default);
+    if let Some(page) = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(url) {
+        return Ok(page.clone());
+    }
+    let page = match agent(8).get(url).call() {
+        Ok(response) => response.into_string().map_err(|e| e.to_string())?,
+        Err(ureq::Error::Status(404, _)) => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    if keep {
+        KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(url.to_string(), page.clone());
+    }
+    Ok(page)
+}
+
+// The site's links to artists ("2,293,0.html") and songs ("2,293,5512.html"):
+// (artist number, song number, the link's text without a count like "(66)" at its end)
+fn tekstovi_links(page: &str) -> Vec<(String, String, String)> {
+    static LINK: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)<a\s[^>]*href\s*=\s*["'][^"']*?\b2,(\d+),(\d+)\.html["'][^>]*>(.*?)</a>"#).unwrap());
+    static COUNT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\s*\(\d+\)\s*$").unwrap());
+    LINK.captures_iter(page)
+        .map(|link| (link[1].to_string(), link[2].to_string(), COUNT.replace(html_text(&link[3]).trim(), "").to_string()))
+        .collect()
+}
+
+// The lyrics on a song's page: the paragraphs marked as lyrics, or else the stretch of
+// the page with the most line breaks (a song's lines), if it looks like a song
+fn tekstovi_lyrics(page: &str) -> Option<String> {
+    static MARKED: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?is)<(p|div)\s[^>]*class\s*=\s*["'][^"']*\blyric\b[^"']*["'][^>]*>(.*?)</(p|div)>"#).unwrap());
+    static BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?is)<script.*?</script>|<style.*?</style>|</?(?:p|div|section|article|aside|header|footer|nav|form|table|tr|td|ul|ol|li|h[1-6]|textarea|button)\b[^>]*>").unwrap()
+    });
+    let marked: Vec<String> = MARKED.captures_iter(page).map(|block| html_text(&block[2])).filter(|text| !text.is_empty()).collect();
+    let text = if marked.is_empty() {
+        let breaks = |piece: &&str| piece.to_lowercase().matches("<br").count();
+        let longest = BLOCK.split(page).max_by_key(breaks)?;
+        if breaks(&longest) < 6 {
+            return None;
+        }
+        html_text(longest)
+    } else {
+        marked.join("\n\n")
+    };
+    (text.lines().filter(|line| !line.trim().is_empty()).count() >= 4).then_some(text)
+}
+
+// A piece of a web page as plain text: line breaks kept, tags gone
+fn html_text(html: &str) -> String {
+    static BREAK: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\s*<br\s*/?>\s*").unwrap());
+    static TAG: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)<[^>]*>").unwrap());
+    static GAPS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
+    let text = html.replace(['\r', '\n'], " ");
+    let text = BREAK.replace_all(&text, "\n");
+    let text = TAG.replace_all(&text, "");
+    static NUMBERED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"&#(\d+);").unwrap());
+    let text = NUMBERED.replace_all(&text, |code: &regex::Captures| code[1].parse::<u32>().ok().and_then(char::from_u32).map_or(String::new(), String::from));
+    let text = text.replace("&nbsp;", " ").replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    let text = text.lines().map(|line| line.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n");
+    GAPS.replace_all(text.trim(), "\n\n").to_string()
 }
 
 // ---------- Timed lyrics ----------
@@ -431,8 +747,8 @@ pub fn lrc_file_text(artist: &str, title: &str, album: &str, duration: f32, sync
     if duration > 0.0 {
         lines.push(format!("[length:{}]", crate::app::format_time(duration)));
     }
-    let info = regex::Regex::new(r"(?i)^\[[a-z]+:").unwrap();
-    lines.extend(synced.lines().filter(|row| !info.is_match(row)).map(str::to_string));
+    static INFO: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)^\[[a-z]+:").unwrap());
+    lines.extend(synced.lines().filter(|row| !INFO.is_match(row)).map(str::to_string));
     lines.join("\n") + "\n"
 }
 
@@ -529,13 +845,172 @@ mod local_first {
         std::fs::write(dir.join("lyrics/Band - Song.txt"), "Saved").unwrap();
         let query = super::Query {
             path: dir.join("Song.mp3"), lyrics_dir: dir.join("lyrics"), file_name: "Band - Song".into(),
-            artist: "Band".into(), title: "Song".into(), album: String::new(), duration: 100.0,
+            artist: "Band".into(), title: "Song".into(), album: String::new(), duration: 100.0, cache_dir: dir.join("lyrics-cache"),
         };
         // An online source picked for the song doesn't win over them
-        assert_eq!(super::find(&query, Some("lrclib")).source, "lrc");
-        assert_eq!(super::find(&query, None).source, "lrc");
-        assert_eq!(super::find(&query, Some("saved")).source, "saved");
+        assert_eq!(super::find(&query, Some("lrclib"), false).source, "lrc");
+        assert_eq!(super::find(&query, None, false).source, "lrc");
+        assert_eq!(super::find(&query, Some("saved"), false).source, "saved");
         std::fs::remove_file(dir.join("Song.lrc")).unwrap();
-        assert_eq!(super::find(&query, Some("netease")).source, "saved");
+        assert_eq!(super::find(&query, Some("netease"), false).source, "saved");
+    }
+}
+
+#[cfg(test)]
+mod remembering {
+    use super::*;
+
+    fn query(dir: &Path) -> Query {
+        Query {
+            path: dir.join("Song.mp3"), lyrics_dir: dir.join("lyrics"), cache_dir: dir.join("lyrics-cache"), file_name: "Band - Song".into(),
+            artist: "Band".into(), title: "Song".into(), album: String::new(), duration: 100.0,
+        }
+    }
+
+    #[test]
+    fn answers_are_asked_once() {
+        let dir = std::env::temp_dir().join(format!("lyrics-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let query = query(&dir);
+        let timed = Found { synced: Some("[00:01.00] One\n[00:02.00] Two".into()), source: "lrclib".into(), source_name: "LRCLIB".into(), ..Default::default() };
+        let asked = std::cell::Cell::new(0);
+        let ask = |found: Option<Found>, reached_all: bool| {
+            asked.set(asked.get() + 1);
+            Online { found, reached_all, reached_any: reached_all }
+        };
+        // Found: kept, with its source, and not asked for again
+        assert!(remembered(&query, "best", false, || ask(Some(timed.clone()), true)).found.is_some());
+        let again = remembered(&query, "best", false, || ask(None, true)).found.unwrap();
+        assert_eq!((asked.get(), again.synced, again.source.as_str(), again.saved), (1, timed.synced.clone(), "lrclib", false));
+        // ...unless asked to look again
+        assert!(remembered(&query, "best", true, || ask(None, true)).found.is_none());
+        assert_eq!(asked.get(), 2);
+        // "Nothing found" is kept too, but not when a source couldn't be reached
+        assert!(remembered(&query, "best", false, || ask(Some(timed.clone()), true)).found.is_none());
+        assert_eq!(asked.get(), 2);
+        let other = Query { title: "Other".into(), ..query.clone() };
+        assert!(remembered(&other, "best", false, || ask(None, false)).found.is_none());
+        assert!(remembered(&other, "best", false, || ask(Some(timed.clone()), true)).found.is_some());
+        assert_eq!(asked.get(), 4);
+        // Another length is another version of the song, and a picked source has its own answer
+        assert!(read_cache(&cache_file(&Query { duration: 250.0, ..other.clone() }, "best")).is_none());
+        assert!(read_cache(&cache_file(&other, "netease")).is_none());
+        // Old "nothing found" and second-best finds are asked again; timed lyrics stay
+        let old = |file: &Path| {
+            let mut value: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+            value["checked"] = serde_json::json!(now() - ASK_AGAIN - 1);
+            std::fs::write(file, value.to_string()).unwrap();
+        };
+        old(&cache_file(&query, "best"));
+        assert!(read_cache(&cache_file(&query, "best")).is_none());
+        old(&cache_file(&other, "best"));
+        assert!(read_cache(&cache_file(&other, "best")).is_some());
+        write_cache(&cache_file(&other, "best"), &other, Some(&Found { plain: Some("Words".into()), ..Default::default() }));
+        assert!(read_cache(&cache_file(&other, "best")).is_some());
+        old(&cache_file(&other, "best"));
+        assert!(read_cache(&cache_file(&other, "best")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Lyrics inside a song file are found before anything online (when the test files
+    // ffmpeg made are in /tmp/rt: mp3s with plain and with timed lyrics, an m4a, a flac)
+    #[test]
+    fn lyrics_inside_the_file() {
+        let source = Path::new("/tmp/rt");
+        if !source.join("plain-lyrics.mp3").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lyrics-inside-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, text, timed) in [
+            ("plain-lyrics.mp3", "First line\nSecond line", false),
+            ("timed-lyrics.mp3", "[00:01.00] One\n[00:02.00] Two\n[00:03.00] Three", true),
+            ("lyrics.m4a", "In an m4a\nSecond", false),
+            ("lyrics.flac", "In a flac\nSecond", false),
+        ] {
+            let query = Query { path: source.join(file), ..query(&dir) };
+            let found = find(&query, None, false);
+            assert_eq!((found.source.as_str(), found.synced.is_some(), found.plain.is_some()), ("tags", timed, !timed), "{file}");
+            assert_eq!(found.plain.or(found.synced).unwrap(), text);
+        }
+        assert!(embedded(&source.join("tiny.mp3")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serbian_names() {
+        use crate::names::{same_name, to_latin, without_accents};
+        assert_eq!(to_latin("Рибља Чорба"), "Riblja Čorba");
+        assert_eq!(to_latin("Џез и Љубав"), "Džez i Ljubav");
+        assert_eq!(to_latin("Riblja Čorba"), "Riblja Čorba");
+        assert_eq!(without_accents("Đorđe Balašević"), "Dorde Balasevic");
+        assert_eq!(without_accents("Ноћни воз"), "Nocni voz");
+        assert!(same_name("Рибља чорба", "Riblja Corba"));
+        assert_eq!(variants("Riblja Čorba", "Noćni voz (Live)"), vec![
+            ("Riblja Čorba".to_string(), "Noćni voz (Live)".to_string()),
+            ("Riblja Čorba".to_string(), "Noćni voz".to_string()),
+            ("Riblja Corba".to_string(), "Nocni voz".to_string()),
+        ]);
+    }
+
+    // The whole way through a pretend Tekstovi.net (a little web server here): an artist
+    // typed without accents is found under its accented letter, then the song, then its words
+    #[test]
+    fn a_song_on_tekstovi() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                    header.clear();
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("").replace("%2C", ",").replace("%C5%BD", "Ž");
+                log.lock().unwrap().push(path.clone());
+                let body = match path.as_str() {
+                    "/2,Z,0.html" => r#"<html><a href="2,5,0.html">Zana</a></html>"#.to_string(),
+                    "/2,Ž,0.html" => r#"<html><a href="2,77,0.html">Željko Samardžić</a> <a href="2,78,0.html">Željko Joksimović</a></html>"#.to_string(),
+                    "/2,78,0.html" => r#"<html><a href="2,78,900.html">Druga</a><a href="2,78,901.html">Noćni voz <small>(12)</small></a></html>"#.to_string(),
+                    "/2,78,901.html" => r#"<html><h1>Noćni voz</h1><p class="blurb">O pjesmi.</p><p class="lyric">Prvi red<br>Drugi red<br><br>Ref.<br>Treći red<br>Četvrti red</p><div>21.11.2026<br>Prijavi</div></html>"#.to_string(),
+                    _ => String::new(),
+                };
+                let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let dir = std::env::temp_dir();
+        let song = Query { artist: "Zeljko Joksimovic".into(), title: "Nocni Voz (Live)".into(), ..query(&dir) };
+        let found = tekstovi_at(&base, &song).unwrap().unwrap();
+        assert_eq!(found.plain.unwrap(), "Prvi red\nDrugi red\n\nRef.\nTreći red\nČetvrti red");
+        assert_eq!((found.source.as_str(), found.synced), ("tekstovi", None));
+        assert_eq!(*asked.lock().unwrap(), vec!["/2,Z,0.html", "/2,Ž,0.html", "/2,78,0.html", "/2,78,901.html"]);
+        // A song the artist doesn't have there, and an artist who isn't there: nothing, no error
+        assert!(tekstovi_at(&base, &Query { title: "Nema je".into(), ..song.clone() }).unwrap().is_none());
+        assert!(tekstovi_at(&base, &Query { artist: "Zzz".into(), ..song.clone() }).unwrap().is_none());
+        // (the lists of artists weren't asked for again)
+        assert_eq!(asked.lock().unwrap().iter().filter(|path| path.ends_with(",0.html") && !path.contains("78")).count(), 2);
+    }
+
+    #[test]
+    fn a_page_of_tekstovi() {
+        // (made up, in the shape the site's pages have)
+        let index = r#"<ul><li><a href="2,293,0.html">Riblja Čorba</a></li><li><a class="x" href='https://tekstovi.net/2,294,0.html'>Regina</a></li></ul><a href="3,0,0.html">Dodaj tekst</a>"#;
+        assert_eq!(tekstovi_links(index), vec![("293".to_string(), "0".to_string(), "Riblja Čorba".to_string()), ("294".to_string(), "0".to_string(), "Regina".to_string())]);
+        let songs = r#"<a href="2,293,5512.html">Pogledaj dom svoj, an&#273;ele <span>(66)</span></a>"#;
+        assert_eq!(tekstovi_links(songs)[0].1, "5512");
+        assert_eq!(tekstovi_links(songs)[0].2, "Pogledaj dom svoj, anđele");
+        let marked = r#"<div><p class="summary">About the song.</p><p class="lyric">First line<br>Second line<br /><br>Ref.<br>Third &amp; fourth<br>Fifth</p><p class="lyricCapt">x</p></div>"#;
+        assert_eq!(tekstovi_lyrics(marked).unwrap(), "First line\nSecond line\n\nRef.\nThird & fourth\nFifth");
+        let unmarked = "<div><p>About the song.</p><div>One<br>Two<br>Three<br><br>Four<br>Five<br>Six<br>Seven</div><div>21.11.2026<br>x</div></div>";
+        assert_eq!(tekstovi_lyrics(unmarked).unwrap(), "One\nTwo\nThree\n\nFour\nFive\nSix\nSeven");
+        assert!(tekstovi_lyrics("<div><p>Nothing here<br>really</p></div>").is_none());
     }
 }

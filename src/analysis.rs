@@ -97,36 +97,47 @@ impl<S: Source> Source for Tap<S> {
 // Turns the recent sound into bar heights (0 to 1), smoothed so the bars rise quickly
 // and fall slowly, like the web version's
 pub struct Spectrum {
-    planner: FftPlanner<f32>,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+    window: Vec<f32>,             // a Hann window, worked out once
+    buffer: Vec<Complex<f32>>,    // the moment being analysed (used again every frame)
+    scratch: Vec<Complex<f32>>,
     pub levels: [f32; BARS],
     peak: f32, // the loudest bar lately: quiet songs still fill the bars
 }
 
 impl Default for Spectrum {
     fn default() -> Self {
-        Spectrum { planner: FftPlanner::new(), levels: [0.0; BARS], peak: 0.3 }
+        let fft = FftPlanner::new().plan_fft_forward(WINDOW);
+        let zero = Complex { re: 0.0, im: 0.0 };
+        Spectrum {
+            window: (0..WINDOW).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (WINDOW - 1) as f32).cos()).collect(),
+            buffer: vec![zero; WINDOW],
+            scratch: vec![zero; fft.get_inplace_scratch_len()],
+            fft,
+            levels: [0.0; BARS],
+            peak: 0.3,
+        }
     }
 }
 
 impl Spectrum {
     // Returns true while the bars are still moving
     pub fn update(&mut self, recent: &Recent, playing: bool) -> bool {
-        let (samples, rate) = match recent.inner.lock() {
-            Ok(shared) if playing && shared.samples.len() == WINDOW => (shared.samples.clone(), shared.sample_rate.max(1)),
-            _ => (Vec::new(), 1),
+        // The recent sound goes straight into the buffer, through a Hann window (so the
+        // edges of the moment don't add false frequencies)
+        let rate = match recent.inner.lock() {
+            Ok(shared) if playing && shared.samples.len() == WINDOW => {
+                for ((slot, sample), w) in self.buffer.iter_mut().zip(&shared.samples).zip(&self.window) {
+                    *slot = Complex { re: sample * w, im: 0.0 };
+                }
+                Some(shared.sample_rate.max(1))
+            }
+            _ => None,
         };
         let mut target = [0.0f32; BARS];
-        if !samples.is_empty() {
-            // A Hann window, so the edges of the moment don't add false frequencies
-            let mut buffer: Vec<Complex<f32>> = samples
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (WINDOW - 1) as f32).cos();
-                    Complex { re: s * w, im: 0.0 }
-                })
-                .collect();
-            self.planner.plan_fft_forward(WINDOW).process(&mut buffer);
+        if let Some(rate) = rate {
+            self.fft.process_with_scratch(&mut self.buffer, &mut self.scratch);
+            let buffer = &self.buffer;
             let bin_hz = rate as f32 / WINDOW as f32;
             // Higher bars cover wider ranges, the way we hear pitch (40 Hz to 14 kHz)
             for (bar, level) in target.iter_mut().enumerate() {

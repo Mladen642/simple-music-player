@@ -157,7 +157,7 @@ pub fn scan(root: &Path) -> Listing {
             let Ok(rel) = path.strip_prefix(root) else { continue };
             let rel = rel.to_string_lossy().replace('\\', "/");
             if AUDIO_EXTENSIONS.contains(&extension.as_str()) {
-                let modified = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64);
+                let modified = modified_ms(&meta);
                 listing.songs.push(Entry { rel, size: meta.len(), modified });
             } else if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
                 // One picture per folder, preferring names like cover.jpg or folder.jpg
@@ -172,6 +172,11 @@ pub fn scan(root: &Path) -> Listing {
     // "Folder order": the way a file manager lists them
     listing.songs.sort_by_cached_key(|entry| entry.rel.to_lowercase());
     listing
+}
+
+// When a file was last changed, in milliseconds since 1970
+pub fn modified_ms(meta: &std::fs::Metadata) -> u64 {
+    meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64)
 }
 
 // Checks the folder every few seconds and sends its listing whenever it changed.
@@ -238,4 +243,110 @@ pub fn read_tags_in_background(songs: Vec<(String, PathBuf)>, send: Sender<crate
         }
         wake();
     });
+}
+
+// ---------- Remembered tags ----------
+
+// What read_tags found in each file, kept in tags.json so the next start doesn't open
+// every song again. An answer is used only while the file's size and date are the same,
+// so a song that changed (new tags, a new download) is simply read again.
+pub struct TagCache {
+    file: PathBuf,
+    entries: HashMap<String, Cached>, // the file's full path -> what was read
+    changed: bool,
+}
+
+struct Cached {
+    size: u64,
+    modified: u64,
+    tags: Names,
+    duration: f32,
+    bitrate: u32,
+}
+
+impl TagCache {
+    pub fn load(data: &Path) -> TagCache {
+        use serde_json::Value;
+        let file = data.join("tags.json");
+        let mut cache = TagCache { file: file.clone(), entries: HashMap::new(), changed: false };
+        let Some(value) = std::fs::read_to_string(&file).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok()) else { return cache };
+        let Some(files) = value.get("files").and_then(Value::as_object) else { return cache };
+        for (path, entry) in files {
+            // [size, modified, title, artist, album, genre, seconds, kbps]; anything else is skipped
+            let Some(list) = entry.as_array().filter(|list| list.len() == 8) else { continue };
+            let text = |i: usize| list[i].as_str().map(str::to_string);
+            let (Some(size), Some(modified), Some(title), Some(artist), Some(album), Some(genre), Some(duration), Some(bitrate)) =
+                (list[0].as_u64(), list[1].as_u64(), text(2), text(3), text(4), text(5), list[6].as_f64(), list[7].as_u64())
+            else {
+                continue;
+            };
+            cache.entries.insert(path.clone(), Cached { size, modified, tags: Names { title, artist, album, genre }, duration: duration as f32, bitrate: bitrate as u32 });
+        }
+        cache
+    }
+
+    // The tags read earlier, if the file is still the same one
+    pub fn get(&self, path: &Path, size: u64, modified: u64) -> Option<(Names, f32, u32)> {
+        let cached = self.entries.get(path.to_string_lossy().as_ref())?;
+        (cached.size == size && cached.modified == modified).then(|| (cached.tags.clone(), cached.duration, cached.bitrate))
+    }
+
+    pub fn put(&mut self, path: &Path, size: u64, modified: u64, tags: &Names, duration: f32, bitrate: u32) {
+        self.entries.insert(path.to_string_lossy().to_string(), Cached { size, modified, tags: tags.clone(), duration, bitrate });
+        self.changed = true;
+    }
+
+    // Forgets files that are gone from this folder (other folders' answers are kept)
+    pub fn keep_only(&mut self, root: &Path, songs: &[Entry]) {
+        let prefix = format!("{}/", root.to_string_lossy().trim_end_matches('/'));
+        let here: std::collections::HashSet<&str> = songs.iter().map(|entry| entry.rel.as_str()).collect();
+        let before = self.entries.len();
+        self.entries.retain(|path, _| path.strip_prefix(&prefix).is_none_or(|rel| here.contains(rel)));
+        self.changed |= self.entries.len() != before;
+    }
+
+    pub fn save_if_needed(&mut self) {
+        if !self.changed {
+            return;
+        }
+        let files: serde_json::Map<String, serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|(path, c)| (path.clone(), serde_json::json!([c.size, c.modified, c.tags.title, c.tags.artist, c.tags.album, c.tags.genre, c.duration, c.bitrate])))
+            .collect();
+        let text = serde_json::to_string(&serde_json::json!({ "version": 1, "files": files })).unwrap_or_default();
+        match crate::store::write_safely(&self.file, &text) {
+            Ok(()) => self.changed = false,
+            Err(error) => eprintln!("Couldn't save tags.json: {error}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_cache_round_trip() {
+        let data = std::env::temp_dir().join(format!("mp-tag-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let root = Path::new("/music");
+        let names = Names { title: "Noćni Voz".into(), artist: "Band".into(), album: String::new(), genre: "Rock, Pop".into() };
+        let mut cache = TagCache::load(&data);
+        cache.put(&root.join("A/one.mp3"), 10, 1700000000123, &names, 201.5, 320);
+        cache.put(&root.join("gone.mp3"), 11, 5, &Names::default(), 1.0, 128);
+        cache.put(Path::new("/elsewhere/kept.mp3"), 12, 6, &Names::default(), 2.0, 128);
+        cache.keep_only(root, &[Entry { rel: "A/one.mp3".into(), size: 10, modified: 1700000000123 }]);
+        cache.save_if_needed();
+
+        let cache = TagCache::load(&data);
+        let (tags, duration, bitrate) = cache.get(&root.join("A/one.mp3"), 10, 1700000000123).unwrap();
+        assert_eq!((tags.title.as_str(), tags.artist.as_str(), tags.album.as_str(), tags.genre.as_str()), ("Noćni Voz", "Band", "", "Rock, Pop"));
+        assert_eq!((duration, bitrate), (201.5, 320));
+        assert!(cache.get(&root.join("A/one.mp3"), 10, 1700000000124).is_none(), "a changed file is read again");
+        assert!(cache.get(&root.join("A/one.mp3"), 9, 1700000000123).is_none());
+        assert!(cache.get(&root.join("gone.mp3"), 11, 5).is_none(), "files that left the folder are forgotten");
+        assert!(cache.get(Path::new("/elsewhere/kept.mp3"), 12, 6).is_some(), "other folders are kept");
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }

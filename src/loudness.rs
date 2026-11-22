@@ -141,3 +141,17 @@ mod tests {
         assert_eq!(super::gain(&None), 1.0);
     }
 }
+
+#[cfg(test)]
+mod compare {
+    // Measures the test songs ffmpeg measured before (when they're there)
+    #[test]
+    fn like_ffmpeg() {
+        for name in ["Band A - Loud One.mp3", "Band A - Sung.mp3", "Band B - Quiet One.mp3"] {
+            let path = std::path::Path::new("/tmp/e3/music").join(name);
+            if path.exists() {
+                println!("{name}: {:?}", super::measure(&path));
+            }
+        }
+    }
+}

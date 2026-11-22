@@ -186,6 +186,7 @@ pub struct App {
     pub songs: Vec<Song>,
     by_id: HashMap<String, usize>,
     folder_covers: HashMap<String, String>,
+    tag_cache: library::TagCache, // tags read before (tags.json), so a start doesn't read every file again
     pub tags_waiting: usize,
     pub listed: bool, // the folder was read at least once
 
@@ -211,6 +212,8 @@ pub struct App {
     view_dirty: bool,
     pub stats: Stats,
     stats_dirty: bool,
+    favorites: Arc<Vec<(String, String, String)>>, // the Favorites card's list, rebuilt when something changed
+    favorites_at: Option<u64>,                     // the library's change count it was built at
 
     // The rest of the screen
     pub search: String,
@@ -223,6 +226,7 @@ pub struct App {
     pub hover_theme: Option<&'static str>, // a theme being pointed at in the menu (a preview)
     pub focus_search: bool,
     pub lyrics: Option<LyricsView>,
+    lyrics_ahead: Option<String>, // the playing song whose next song's lyrics were looked up already
     pub lyrics_menu_open: bool,
     pub editing: Option<EditForm>,
     pub tidy: Option<Vec<Tidy>>,
@@ -232,7 +236,8 @@ pub struct App {
     paused: Arc<std::sync::atomic::AtomicBool>,     // folder watching waits while files are being changed
     // Albums and genres from Wikipedia
     pub wiki: Arc<std::sync::Mutex<crate::wiki::Cache>>,
-    wiki_line: Arc<(std::sync::Mutex<std::collections::VecDeque<(String, String, String)>>, std::sync::Condvar)>,
+    wiki_line: Arc<(std::sync::Mutex<std::collections::VecDeque<(String, String, String, String)>>, std::sync::Condvar)>, // (key, artist, title, album)
+    wiki_list_stale: Option<Instant>, // answers came in since the suggestions were last put together
     wiki_started: bool,
     pub wiki_waiting: usize,
     pub wiki_offline: bool,
@@ -298,6 +303,7 @@ impl App {
             songs: Vec::new(),
             by_id: HashMap::new(),
             folder_covers: HashMap::new(),
+            tag_cache: library::TagCache::load(&data),
             tags_waiting: 0,
             listed: false,
             player,
@@ -317,6 +323,8 @@ impl App {
             view_dirty: true,
             stats: Stats::default(),
             stats_dirty: true,
+            favorites: Arc::default(),
+            favorites_at: None,
             search: String::new(),
             search_results: Vec::new(),
             searched: String::new(),
@@ -327,6 +335,7 @@ impl App {
             hover_theme: None,
             focus_search: false,
             lyrics: None,
+            lyrics_ahead: None,
             lyrics_menu_open: false,
             editing: None,
             tidy: None,
@@ -336,6 +345,7 @@ impl App {
             paused: Arc::default(),
             wiki: Arc::new(std::sync::Mutex::new(crate::wiki::Cache::load(&data))),
             wiki_line: Arc::default(),
+            wiki_list_stale: None,
             wiki_started: false,
             wiki_waiting: 0,
             wiki_offline: false,
@@ -418,7 +428,8 @@ impl App {
     // new ones are added and their tags read, removed ones go away
     fn take_listing(&mut self, listing: Listing) {
         let mut old: HashMap<String, Song> = self.songs.drain(..).map(|song| (format!("{}|{}", song.rel, song.size), song)).collect();
-        let mut new_songs = Vec::new();
+        let mut new_songs = Vec::new(); // every song that wasn't here before
+        let mut unread = Vec::new();    // those whose tags still have to be read
         let mut added = 0;
         for entry in &listing.songs {
             let song = match old.remove(&format!("{}|{}", entry.rel, entry.size)) {
@@ -426,17 +437,36 @@ impl App {
                 None => {
                     added += 1;
                     let mut song = Song::new(entry, &self.folder);
-                    song.apply_record(self.library.get(&song.id));
                     new_songs.push((song.id.clone(), song.path.clone()));
+                    match self.tag_cache.get(&song.path, entry.size, entry.modified) {
+                        // Read at an earlier start, and the file is the same: no need to open it
+                        Some((tags, duration, bitrate)) => {
+                            song.tags = tags;
+                            song.duration = duration;
+                            song.bitrate = bitrate;
+                            song.tags_read = true;
+                            song.natural = names::natural_names(&song.tags, &song.rel);
+                            song.apply_record(self.library.get(&song.id));
+                            library::remember_song(&mut self.library, &song);
+                        }
+                        None => {
+                            song.apply_record(self.library.get(&song.id));
+                            unread.push((song.id.clone(), song.path.clone()));
+                        }
+                    }
                     song
                 }
             };
             self.songs.push(song);
         }
+        self.tag_cache.keep_only(&self.folder, &listing.songs);
         let removed = old.len();
         debug(&format!("listing: {} files, {} songs now, {added} added, {removed} removed", listing.songs.len(), self.songs.len()));
         self.folder_covers = listing.folder_covers;
         self.reindex();
+        if self.listed && added > 0 {
+            self.wiki_started = false; // new songs: once their tags are read, Wikipedia is asked about them too
+        }
         if self.listed && (added > 0 || removed > 0) {
             let mut parts = Vec::new();
             if added > 0 {
@@ -453,10 +483,10 @@ impl App {
                 self.meter.request(id.clone(), path.clone(), false);
             }
         }
-        if !new_songs.is_empty() {
-            self.tags_waiting += new_songs.len();
+        if !unread.is_empty() {
+            self.tags_waiting += unread.len();
             let ctx = self.ctx.clone();
-            library::read_tags_in_background(new_songs, self.send.clone(), move || ctx.request_repaint());
+            library::read_tags_in_background(unread, self.send.clone(), move || ctx.request_repaint());
         }
     }
 
@@ -495,6 +525,10 @@ impl App {
                         song.tags_read = true;
                         song.natural = names::natural_names(&song.tags, &song.rel);
                         song.apply_record(self.library.get(&song.id));
+                        // Kept for the next start (not a file that couldn't be read: maybe next time)
+                        if song.duration > 0.0 || song.tags != names::Names::default() {
+                            self.tag_cache.put(&song.path, song.size, song.modified, &song.tags, song.duration, song.bitrate);
+                        }
                         library::remember_song(&mut self.library, &self.songs[i]);
                         if self.current.as_deref() == Some(result.id.as_str()) && self.duration <= 0.0 {
                             self.duration = result.duration;
@@ -508,10 +542,16 @@ impl App {
                     let options = egui::TextureOptions::LINEAR;
                     let entry = self.textures.entry(cover.id.clone()).or_default();
                     entry.none = cover.big.is_none() && cover.small.is_none();
-                    if let Some(image) = cover.big {
+                    // The large pictures are kept only for the song that's playing (see
+                    // forget_big_covers); one that arrives after a skip isn't needed any more
+                    let is_current = self.current.as_deref() == Some(cover.id.as_str());
+                    if !is_current && (cover.big.is_some() || cover.backdrop.is_some()) {
+                        self.requested.remove(&(cover.id.clone(), true));
+                    }
+                    if let Some(image) = cover.big.filter(|_| is_current) {
                         entry.big = Some(self.ctx.load_texture(format!("{}-big", cover.id), image, options));
                     }
-                    if let Some(image) = cover.backdrop {
+                    if let Some(image) = cover.backdrop.filter(|_| is_current) {
                         entry.backdrop = Some(self.ctx.load_texture(format!("{}-backdrop", cover.id), image, options));
                     }
                     if let Some(image) = cover.small {
@@ -540,7 +580,13 @@ impl App {
                 Event::Checked(result) => {
                     self.downloads.checking = false;
                     match result {
-                        Ok((playlist, entries)) => {
+                        Ok((playlist, mut entries)) => {
+                            // Songs that are here already (same artist and title) aren't ticked
+                            let here: HashSet<String> = self.songs.iter().filter(|s| s.known_artist()).map(|s| format!("{}|{}", names::simplify(&s.artist), names::simplify(&s.title))).collect();
+                            for entry in &mut entries {
+                                entry.have = !entry.artist.is_empty() && here.contains(&format!("{}|{}", names::simplify(&entry.artist), names::simplify(&entry.title)));
+                                entry.chosen = !entry.have;
+                            }
                             self.downloads.error = entries.is_empty().then(|| "No songs found at that link.".to_string());
                             self.downloads.playlist = playlist;
                             self.downloads.entries = entries;
@@ -565,7 +611,8 @@ impl App {
                         self.wiki_fill = None;
                         self.fill_from_wiki(&key);
                     }
-                    self.refresh_wiki_list();
+                    // (the suggestions are put together in tick, not after every single answer)
+                    self.wiki_list_stale.get_or_insert_with(Instant::now);
                 }
                 Event::Lyrics(id, found) => {
                     if let Some(view) = self.lyrics.as_mut().filter(|view| view.id == id) {
@@ -604,6 +651,10 @@ impl App {
                 }
             }
         }
+        // A little into a song (so skipping through songs doesn't look each one up twice)
+        if self.lyrics_ahead.as_deref() != self.current.as_deref() && self.player.is_playing() && self.player.position() > 8.0 {
+            self.prefetch_lyrics();
+        }
         // The desktop's media controls show what's happening
         let playing = self.player.is_playing();
         if playing != self.media_shown.0 || self.media_shown.1.elapsed() > Duration::from_secs(5) {
@@ -614,13 +665,18 @@ impl App {
             self.wiki_started = true;
             self.queue_wiki_lookups();
         }
+        // Suggestions follow the answers: when the last one is in, or once a second meanwhile
+        if self.wiki_list_stale.is_some_and(|since| self.wiki_waiting == 0 || since.elapsed() > Duration::from_secs(1)) {
+            self.refresh_wiki_list();
+        }
         if self.wiki_saved_at.elapsed() > Duration::from_secs(20) {
             self.wiki_saved_at = Instant::now();
             self.wiki.lock().unwrap().save(&self.data);
         }
-        // The equalizer
+        // The equalizer (it rests while the window is minimized: nobody sees it)
         let playing_now = self.player.is_playing();
-        self.eq_moving = self.spectrum.update(&self.player.recent, playing_now);
+        let minimized = self.ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        self.eq_moving = !minimized && self.spectrum.update(&self.player.recent, playing_now);
         // The cover behind everything: the playing song's, fading in over the old one
         if let Some(id) = self.current.clone() {
             let ready = self.textures.get(&id).and_then(|c| c.backdrop.clone());
@@ -642,6 +698,13 @@ impl App {
             self.saved_prefs = self.prefs.clone();
         }
         self.library.save_if_needed(false);
+        if self.tags_waiting == 0 {
+            self.tag_cache.save_if_needed();
+        }
+        // Favorites show names from the records and from the songs: either may have changed
+        if self.view_dirty || self.stats_dirty || self.favorites_at != Some(self.library.changes()) {
+            self.rebuild_favorites();
+        }
         if self.view_dirty {
             self.rebuild_view();
         }
@@ -655,6 +718,7 @@ impl App {
 
     pub fn save_all(&mut self) {
         self.library.save_if_needed(true);
+        self.tag_cache.save_if_needed();
         if self.loudness_changed.is_some() {
             crate::loudness::save(&self.data, &self.loudness);
         }
@@ -689,8 +753,8 @@ impl App {
                 self.duration = duration;
                 self.scroll_to_current = true;
                 self.media.show_song(&title, &artist, &album, duration);
+                self.forget_big_covers(id);
                 self.request_cover(id, true);
-                self.view_dirty = true; // the playing marks move
                 self.apply_even_volume();
                 if !self.loudness.contains_key(id) {
                     self.meter.request(id.to_string(), path.clone(), true);
@@ -918,6 +982,8 @@ impl App {
                 song.apply_record(self.library.get(&new_id));
             }
         }
+        let new_id = self.song_id(&new_rel, size);
+        self.remember_tags(&new_id);
         // The song playing was changed on disk: it continues from the same moment
         if playing_here {
             if let Some(song) = self.current_song() {
@@ -981,6 +1047,15 @@ impl App {
         song.size = size;
         song.apply_record(self.library.get(&song.id));
         self.reindex();
+    }
+
+    // A song's file was renamed or got new tags: what's remembered about its tags follows
+    // (the file's date changed), so the next start doesn't read it again
+    fn remember_tags(&mut self, id: &str) {
+        let Some(song) = self.song(id).filter(|song| song.tags_read) else { return };
+        let Ok(meta) = std::fs::metadata(&song.path) else { return };
+        let (path, tags, duration, bitrate) = (song.path.clone(), song.tags.clone(), song.duration, song.bitrate);
+        self.tag_cache.put(&path, meta.len(), library::modified_ms(&meta), &tags, duration, bitrate);
     }
 
     // Puts the file's own names back (the pencil's "Use the original names")
@@ -1100,6 +1175,7 @@ impl App {
                     reload = Some(new_id.clone()); // its file was rewritten: it goes on from the same moment
                 }
             }
+            self.remember_tags(&new_id);
         }
         if let Some(id) = reload {
             self.reload_current(&id);
@@ -1146,6 +1222,8 @@ impl App {
             if crate::edit::rename(&self.folder, to, from).is_ok() {
                 let size = std::fs::metadata(self.folder.join(from)).map_or(0, |m| m.len());
                 self.move_song(&id, from, size, modified);
+                let new_id = self.song_id(from, size);
+                self.remember_tags(&new_id);
                 done += 1;
             }
         }
@@ -1376,7 +1454,7 @@ impl App {
         std::thread::spawn(move || {
             let mut asker = crate::wiki::Asker::default();
             loop {
-                let (key, artist, title) = {
+                let (key, artist, title, album) = {
                     let (jobs, ready) = &*line;
                     let mut jobs = jobs.lock().unwrap();
                     loop {
@@ -1386,7 +1464,7 @@ impl App {
                         jobs = ready.wait(jobs).unwrap();
                     }
                 };
-                let reached = match asker.find(&cache, &artist, &title) {
+                let reached = match asker.find(&cache, &artist, &title, &album) {
                     Ok(found) => {
                         cache.lock().unwrap().put(&key, &found);
                         true
@@ -1402,14 +1480,14 @@ impl App {
         });
     }
 
-    fn ask_wiki(&mut self, key: String, artist: String, title: String, urgent: bool) {
+    fn ask_wiki(&mut self, key: String, artist: String, title: String, album: String, urgent: bool) {
         let (jobs, ready) = &*self.wiki_line;
         let mut jobs = jobs.lock().unwrap();
         if urgent {
-            jobs.retain(|(other, _, _)| *other != key);
-            jobs.push_front((key, artist, title));
-        } else if !jobs.iter().any(|(other, _, _)| *other == key) {
-            jobs.push_back((key, artist, title));
+            jobs.retain(|(other, _, _, _)| *other != key);
+            jobs.push_front((key, artist, title, album));
+        } else if !jobs.iter().any(|(other, _, _, _)| *other == key) {
+            jobs.push_back((key, artist, title, album));
         } else {
             return;
         }
@@ -1425,13 +1503,16 @@ impl App {
             let mut seen = HashSet::new();
             for song in self.songs.iter().filter(|s| s.known_artist()) {
                 let key = crate::wiki::key(&song.artist, &song.title);
-                if cache.get(&key).is_none() && seen.insert(key.clone()) {
-                    wanted.push((key, song.artist.clone(), song.title.clone()));
+                // The album in the song's own tags (not one guessed from its file name, and
+                // not one Wikipedia suggested): its article has genres for songs without one
+                let album = if song.tags.album.is_empty() { String::new() } else { song.album.clone() };
+                if (cache.get(&key).is_none() || cache.could_be_better(&key, !album.is_empty())) && seen.insert(key.clone()) {
+                    wanted.push((key, song.artist.clone(), song.title.clone(), album));
                 }
             }
         }
-        for (key, artist, title) in wanted {
-            self.ask_wiki(key, artist, title, false);
+        for (key, artist, title, album) in wanted {
+            self.ask_wiki(key, artist, title, album, false);
         }
         self.refresh_wiki_list();
     }
@@ -1440,6 +1521,7 @@ impl App {
     // to use), or other ones than the songs have (not ticked). Names you set yourself
     // aren't suggested over.
     pub fn refresh_wiki_list(&mut self) {
+        self.wiki_list_stale = None;
         let cache = self.wiki.lock().unwrap();
         let mut list = Vec::new();
         for song in self.songs.iter().filter(|s| s.known_artist()) {
@@ -1516,8 +1598,8 @@ impl App {
             self.fill_from_wiki(&key);
         } else {
             self.wiki_fill = Some(key.clone());
-            let title = form.title.trim().to_string();
-            self.ask_wiki(key, artist, title, true);
+            let (title, album) = (form.title.trim().to_string(), form.album.trim().to_string());
+            self.ask_wiki(key, artist, title, album, true);
         }
     }
 
@@ -1562,19 +1644,30 @@ impl App {
     // Looks for a song's lyrics in the background. source: a source picked in the menu
     // (it becomes this song's choice), or None for the song's choice or the best match.
     pub fn load_lyrics(&mut self, id: &str, source: Option<&str>) {
-        let Some(song) = self.song(id) else { return };
+        self.load_lyrics_anew(id, source, false);
+    }
+
+    // What a lookup needs to know about a song, and the source picked for it
+    fn lyrics_query(&self, id: &str) -> Option<(lyrics::Query, Option<String>)> {
+        let song = self.song(id)?;
         let album_known = !song.album.is_empty() && (!song.tags.album.is_empty() || song.album != names::guess_from_file_name(&song.rel).album);
         let artist = if song.known_artist() { names::lookup_name(&song.artist) } else { String::new() };
         let query = lyrics::Query {
             path: song.path.clone(),
             lyrics_dir: self.data.join("lyrics"),
+            cache_dir: self.data.join("lyrics-cache"),
             file_name: lyrics::file_name(if song.known_artist() { &song.artist } else { "" }, &song.title),
             artist,
             title: song.title.clone(),
             album: if album_known { song.album.clone() } else { String::new() },
             duration: song.duration,
         };
-        let choice = self.library.get(id).and_then(|record| record.lyrics.clone());
+        Some((query, self.library.get(id).and_then(|record| record.lyrics.clone())))
+    }
+
+    // fresh: ask online again, even when an answer is remembered
+    fn load_lyrics_anew(&mut self, id: &str, source: Option<&str>, fresh: bool) {
+        let Some((query, choice)) = self.lyrics_query(id) else { return };
         self.lyrics = Some(LyricsView { id: id.to_string(), found: None, lines: Vec::new(), offset: 0.0, scrolled_at: None, tapping: None });
         let (send, ctx, id, picked) = (self.send.clone(), self.ctx.clone(), id.to_string(), source.map(str::to_string));
         std::thread::spawn(move || {
@@ -1584,10 +1677,25 @@ impl App {
                     Ok(_) => Found { message: Some(format!("No lyrics from {}.", lyrics::source_name(source))), source: source.clone(), source_name: lyrics::source_name(source), ..Default::default() },
                     Err(_) => Found { message: Some(format!("Couldn't reach {}. Check your internet connection.", lyrics::source_name(source))), source: source.clone(), source_name: lyrics::source_name(source), ..Default::default() },
                 },
-                None => lyrics::find(&query, choice.as_deref()),
+                None => lyrics::find(&query, choice.as_deref(), fresh),
             };
             let _ = send.send(Event::Lyrics(id, found));
             ctx.request_repaint();
+        });
+    }
+
+    // The song that plays next gets its lyrics looked up ahead of time (quietly, into
+    // lyrics-cache), so they're there the moment it starts
+    fn prefetch_lyrics(&mut self) {
+        let Some(current) = self.current.clone() else { return };
+        if self.lyrics_ahead.as_ref() == Some(&current) {
+            return;
+        }
+        self.lyrics_ahead = Some(current.clone());
+        let next = self.queue.iter().position(|id| *id == current).and_then(|i| self.queue.get(i + 1));
+        let Some((query, choice)) = next.and_then(|id| self.lyrics_query(id)) else { return };
+        std::thread::spawn(move || {
+            lyrics::find(&query, choice.as_deref(), false);
         });
     }
 
@@ -1595,7 +1703,7 @@ impl App {
     pub fn pick_lyrics_source(&mut self, source: Option<&str>) {
         let Some(id) = self.current.clone() else { return };
         self.library.change(&id, |record| record.lyrics = source.map(str::to_string));
-        self.load_lyrics(&id, source);
+        self.load_lyrics_anew(&id, source, true); // picking "Best match" again looks everywhere again
     }
 
     // Timed lyrics a little ahead of the singing or behind it, like a video player's
@@ -1740,6 +1848,19 @@ impl App {
     // ---------- Covers ----------
 
     // Asks for a song's cover once (big: also the large picture, for the song playing)
+    // The large cover and the backdrop of every song but this one are let go (each is
+    // over a megabyte on the graphics card), and asked for again if that song plays again.
+    // The backdrop that's fading out keeps its own picture until the fade is over.
+    fn forget_big_covers(&mut self, keep: &str) {
+        for (id, textures) in &mut self.textures {
+            if id != keep && (textures.big.is_some() || textures.backdrop.is_some()) {
+                textures.big = None;
+                textures.backdrop = None;
+            }
+        }
+        self.requested.retain(|(id, big)| !*big || id == keep);
+    }
+
     pub fn request_cover(&mut self, id: &str, big: bool) {
         if !self.requested.insert((id.to_string(), big)) {
             return;
@@ -1774,7 +1895,17 @@ impl App {
 
     // Hearted songs, the latest first: (id, title, artist). A favorite keeps its names in
     // its record, so the list looks complete even for songs in another folder.
-    pub fn favorites(&self) -> Vec<(String, String, String)> {
+    // (The list is put together in rebuild_favorites, only when something changed.)
+    pub fn favorites(&self) -> Arc<Vec<(String, String, String)>> {
+        self.favorites.clone()
+    }
+
+    fn rebuild_favorites(&mut self) {
+        self.favorites_at = Some(self.library.changes());
+        self.favorites = Arc::new(self.list_favorites());
+    }
+
+    fn list_favorites(&self) -> Vec<(String, String, String)> {
         let mut list: Vec<(&String, &store::Record)> = self.library.songs.iter().filter(|(_, r)| r.favorite.is_some()).collect();
         list.sort_by(|a, b| b.1.favorite.cmp(&a.1.favorite));
         list.into_iter()
@@ -1794,7 +1925,7 @@ impl App {
             self.show_toast("That song isn't in the open folder.".into());
             return;
         }
-        let list: Vec<String> = self.favorites().into_iter().map(|(id, _, _)| id).filter(|id| self.song(id).is_some()).collect();
+        let list: Vec<String> = self.list_favorites().into_iter().map(|(id, _, _)| id).filter(|id| self.song(id).is_some()).collect();
         self.play_from_list(id, list);
     }
 
@@ -1855,29 +1986,44 @@ impl App {
             .collect();
 
         let songs = &self.songs;
-        let by_title = |a: &Song, b: &Song| natural_cmp(&a.title, &b.title).then_with(|| natural_cmp(&a.artist, &b.artist));
-        let unknown_last = |a: &Song, b: &Song| (!a.known_artist()).cmp(&!b.known_artist());
-        let plays: HashMap<&str, u64> = songs.iter().map(|s| (s.id.as_str(), self.plays_of(&s.id))).collect();
-        match self.prefs.sort.as_str() {
-            "title" => shown.sort_by(|&a, &b| by_title(&songs[a], &songs[b])),
+        // The names being compared are made ready once per song (lower case, no accents),
+        // not again for every comparison; only the ones this sort looks at
+        let sort = self.prefs.sort.as_str();
+        let keys = |wanted: bool, of: &dyn Fn(&Song) -> String| -> Vec<String> {
+            if wanted { songs.iter().map(of).collect() } else { Vec::new() }
+        };
+        let titles = keys(sort != "folder", &|s| names::normalize(&s.title));
+        let artists = keys(sort != "folder", &|s| names::normalize(&s.artist));
+        let albums = keys(matches!(sort, "artist" | "album"), &|s| names::normalize(&s.album));
+        let rels = keys(matches!(sort, "artist" | "album"), &|s| names::normalize(&s.rel));
+        let genres = keys(sort == "genre", &|s| first_genre(s)); // (already without accents)
+        let by_title = |a: usize, b: usize| natural_cmp_ready(&titles[a], &titles[b]).then_with(|| natural_cmp_ready(&artists[a], &artists[b]));
+        let unknown_last = |a: usize, b: usize| (!songs[a].known_artist()).cmp(&!songs[b].known_artist());
+        match sort {
+            "title" => shown.sort_by(|&a, &b| by_title(a, b)),
             "artist" => shown.sort_by(|&a, &b| {
-                let (a, b) = (&songs[a], &songs[b]);
-                unknown_last(a, b).then_with(|| natural_cmp(&a.artist, &b.artist)).then_with(|| natural_cmp(&a.album, &b.album)).then_with(|| natural_cmp(&a.rel, &b.rel))
+                unknown_last(a, b)
+                    .then_with(|| natural_cmp_ready(&artists[a], &artists[b]))
+                    .then_with(|| natural_cmp_ready(&albums[a], &albums[b]))
+                    .then_with(|| natural_cmp_ready(&rels[a], &rels[b]))
             }),
             "album" => shown.sort_by(|&a, &b| {
-                let (a, b) = (&songs[a], &songs[b]);
-                a.album.is_empty().cmp(&b.album.is_empty()).then_with(|| natural_cmp(&a.album, &b.album)).then_with(|| natural_cmp(&a.rel, &b.rel))
+                songs[a].album.is_empty().cmp(&songs[b].album.is_empty())
+                    .then_with(|| natural_cmp_ready(&albums[a], &albums[b]))
+                    .then_with(|| natural_cmp_ready(&rels[a], &rels[b]))
             }),
             "genre" => shown.sort_by(|&a, &b| {
-                let (a, b) = (&songs[a], &songs[b]);
-                a.genre.is_empty().cmp(&b.genre.is_empty())
-                    .then_with(|| natural_cmp(&first_genre(a), &first_genre(b)))
+                songs[a].genre.is_empty().cmp(&songs[b].genre.is_empty())
+                    .then_with(|| natural_cmp_ready(&genres[a], &genres[b]))
                     .then_with(|| unknown_last(a, b))
-                    .then_with(|| natural_cmp(&a.artist, &b.artist))
+                    .then_with(|| natural_cmp_ready(&artists[a], &artists[b]))
                     .then_with(|| by_title(a, b))
             }),
-            "recent" => shown.sort_by(|&a, &b| songs[b].added.cmp(&songs[a].added).then_with(|| by_title(&songs[a], &songs[b]))),
-            "plays" => shown.sort_by(|&a, &b| plays[songs[b].id.as_str()].cmp(&plays[songs[a].id.as_str()]).then_with(|| by_title(&songs[a], &songs[b]))),
+            "recent" => shown.sort_by(|&a, &b| songs[b].added.cmp(&songs[a].added).then_with(|| by_title(a, b))),
+            "plays" => {
+                let plays: Vec<u64> = songs.iter().map(|s| self.plays_of(&s.id)).collect();
+                shown.sort_by(|&a, &b| plays[b].cmp(&plays[a]).then_with(|| by_title(a, b)))
+            }
             _ => {}
         }
 
@@ -2049,7 +2195,11 @@ fn capitalize(text: &str) -> String {
 
 // Like sorting by hand: ignores case and accents, and "Track 2" comes before "Track 10"
 pub fn natural_cmp(a: &str, b: &str) -> Order {
-    let (a, b) = (names::normalize(a), names::normalize(b));
+    natural_cmp_ready(&names::normalize(a), &names::normalize(b))
+}
+
+// The same, for names that went through names::normalize already
+fn natural_cmp_ready(a: &str, b: &str) -> Order {
     let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
     loop {
         match (x.peek().copied(), y.peek().copied()) {

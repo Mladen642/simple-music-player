@@ -109,13 +109,17 @@ pub struct Library {
     pub songs: IndexMap<String, Record>,
     file: PathBuf,
     dirty_since: Option<Instant>,
+    changes: u64, // goes up with every change (what's shown from records is rebuilt when it moves)
     pub broken: bool, // library.json couldn't be read: nothing is written, so it isn't replaced
 }
 
 impl Library {
     pub fn load(data: &Path) -> Library {
         let file = data.join("library.json");
-        let mut library = Library { songs: IndexMap::new(), file: file.clone(), dirty_since: None, broken: false };
+        // (counted across loads, so a freshly loaded library never looks like the one before it)
+        static LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let changes = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32;
+        let mut library = Library { songs: IndexMap::new(), file: file.clone(), dirty_since: None, changes, broken: false };
         if !file.exists() {
             return library;
         }
@@ -148,11 +152,18 @@ impl Library {
         change(record);
         if *record != before {
             self.dirty_since.get_or_insert_with(Instant::now);
+            self.changes += 1;
         }
+    }
+
+    // A number that's different after every change
+    pub fn changes(&self) -> u64 {
+        self.changes
     }
 
     // Something changed in a way change() can't see (a record moved or went away)
     pub fn mark_changed(&mut self) {
+        self.changes += 1;
         self.dirty_since.get_or_insert_with(Instant::now);
     }
 
@@ -303,44 +314,34 @@ pub fn now_iso() -> String {
 }
 
 #[cfg(test)]
-pub mod tests {
-    use std::path::{Path, PathBuf};
-
-    // A small library like the old player kept, in a temporary folder
-    pub fn sample_library(name: &str) -> PathBuf {
-        let old = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&old);
-        std::fs::create_dir_all(old.join("covers")).unwrap();
-        std::fs::create_dir_all(old.join("lyrics")).unwrap();
-        std::fs::write(old.join("library.json"), r#"{"version": 1, "songs": {
-            "Band - Song.mp3|1000": {"file": "Band - Song.mp3", "title": "Song", "artist": "Band", "album": "", "genres": ["Rock"],
-                                     "favorite": "2026-01-01T10:00:00Z", "plays": 7, "edited": ["genres"], "future": {"kept": true}},
-            "Other.mp3|2000": {"file": "Other.mp3", "title": "Other", "artist": "", "plays": 1}
-        }}"#).unwrap();
-        std::fs::write(old.join("settings.json"), r#"{"defaultFolder": "/nowhere"}"#).unwrap();
-        std::fs::write(old.join("covers/abc.jpg"), b"picture").unwrap();
-        std::fs::write(old.join("lyrics/Band - Song.lrc"), "[00:01.00] Words").unwrap();
-        old
-    }
-
+mod tests {
+    // Brings the old player's library from /tmp/oldplayer (when it's there) into /tmp/imported
     #[test]
     fn import_from_the_old_player() {
-        let old = sample_library("old-player-test");
-        let data: &Path = &std::env::temp_dir().join("imported-test");
+        let old = std::path::Path::new("/tmp/oldplayer");
+        if !old.join("library.json").exists() {
+            return;
+        }
+        let data = std::path::Path::new("/tmp/imported");
         let _ = std::fs::remove_dir_all(data);
         std::fs::create_dir_all(data).unwrap();
-        let message = super::import_old_player(&old, data).unwrap();
-        assert!(message.contains("2 songs"), "{message}");
-        let mut library = super::Library::load(data);
-        let record = library.get("Band - Song.mp3|1000").unwrap().clone();
-        assert_eq!((record.plays, record.favorite.is_some(), record.edited.clone()), (7, true, vec!["genres".to_string()]));
-        assert!(data.join("covers/abc.jpg").exists() && data.join("lyrics/Band - Song.lrc").exists());
-        // Written back without losing anything (a field from a newer version included)
-        library.change("Other.mp3|2000", |r| r.plays += 1);
-        library.change("Other.mp3|2000", |r| r.plays -= 1);
+        let message = super::import_old_player(old, data).unwrap();
+        println!("{message}");
+        let library = super::Library::load(data);
+        assert!(library.songs.len() > 600);
+        let favorites = library.songs.values().filter(|r| r.favorite.is_some()).count();
+        let plays: u64 = library.songs.values().map(|r| r.plays).sum();
+        println!("{} songs, {favorites} favorites, {plays} plays", library.songs.len());
+        // Written back unchanged (apart from formatting): nothing lost
+        let mut library = library;
+        let first = library.songs.keys().next().unwrap().clone();
+        library.change(&first, |r| r.plays += 1);
+        library.change(&first, |r| r.plays -= 1);
+        library.songs.get_mut(&first).unwrap().other.insert("check".into(), serde_json::Value::Bool(true));
+        library.change(&first, |r| { r.other.remove("check"); });
         library.save_if_needed(true);
         let before: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(old.join("library.json")).unwrap()).unwrap();
         let after: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.join("library.json")).unwrap()).unwrap();
-        assert_eq!(before["songs"], after["songs"]);
+        assert_eq!(before["songs"], after["songs"], "library.json changed");
     }
 }

@@ -1,8 +1,11 @@
 // Downloads: songs (or whole playlists) from YouTube and many other sites, saved into
-// the open folder as "Artist - Title.mp3" with their names in the tags.
+// the open folder as "Artist - Title.m4a" (or .mp3) with their names in the tags.
+// The sound is kept as the site has it whenever the player can play that: .m4a (what
+// YouTube has) and .mp3 are saved untouched, which is quicker and loses nothing; only
+// other kinds (like Opus, which the player can't play) are made into mp3.
 // It's done by three free programs:
 //   yt-dlp  finds and downloads the audio (and keeps itself up to date: sites change)
-//   ffmpeg  turns it into mp3
+//   ffmpeg  puts the sound into its file (and makes the mp3 when one is needed)
 //   deno    lets yt-dlp read YouTube's pages
 // Ones already on the computer are used; otherwise "Get them" downloads them once
 // into the player's data folder (bin/).
@@ -147,6 +150,7 @@ pub struct Entry {
     pub artist: String,
     pub title: String,
     pub chosen: bool,
+    pub have: bool, // a song with this artist and title is in the library already
 }
 
 // What a link holds (without downloading): the playlist's name, if it's one, and its songs
@@ -167,7 +171,7 @@ pub fn check(tools: &Tools, link: &str) -> Result<(String, Vec<Entry>), String> 
         };
         let named = names::natural_names(&tags, "");
         let url = [text("webpage_url"), text("url")].into_iter().find(|t| t.starts_with("http")).unwrap_or_else(|| fallback_url.to_string());
-        Entry { url, artist: if named.artist == names::UNKNOWN_ARTIST { String::new() } else { named.artist }, title: named.title, chosen: true }
+        Entry { url, artist: if named.artist == names::UNKNOWN_ARTIST { String::new() } else { named.artist }, title: named.title, chosen: true, have: false }
     };
     match info.get("entries").and_then(Value::as_array) {
         Some(list) => {
@@ -193,21 +197,27 @@ pub enum State {
 // Running yt-dlp processes, so Cancel can stop them
 pub type Running = Arc<Mutex<Vec<(usize, Child)>>>;
 
-// Downloads one song into the folder as "Artist - Title.mp3" (never over another file),
-// then writes its names into the tags. progress: called with the new state.
+// The kinds of file a download can end up as
+const SAVED_AS: [&str; 2] = ["m4a", "mp3"];
+
+// Downloads one song into the folder as "Artist - Title.m4a" or ".mp3" (never over
+// another file), then writes its names into the tags. progress: called with the new state.
 pub fn download(tools: &Tools, folder: &Path, job: usize, entry: &Entry, running: &Running, progress: &dyn Fn(State)) -> State {
     let base = crate::edit::file_name_for("x.mp3", &entry.title, if entry.artist.is_empty() { names::UNKNOWN_ARTIST } else { &entry.artist });
     let base = base.strip_suffix(".mp3").unwrap_or("song").to_string();
-    let mut name = format!("{base}.mp3");
+    let taken = |stem: &str| SAVED_AS.iter().any(|kind| folder.join(format!("{stem}.{kind}")).exists() || folder.join(format!("{stem}.{kind}.part")).exists());
+    let mut stem = base.clone();
     let mut n = 2;
-    while folder.join(&name).exists() || folder.join(format!("{}.part", name)).exists() {
-        name = format!("{base} ({n}).mp3");
+    while taken(&stem) {
+        stem = format!("{base} ({n})");
         n += 1;
     }
-    let stem = name.strip_suffix(".mp3").unwrap_or(&name).to_string();
     let template = folder.join(format!("{}.%(ext)s", stem.replace('%', "%%")));
     let mut command = tools.command();
-    command.args(["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-playlist", "--no-mtime", "--newline"])
+    // The sound as the site has it, m4a first, then mp3, then whatever there is.
+    // "m4a>m4a/mp3>mp3/aac>m4a/mp3": m4a and mp3 stay as they are, bare AAC goes into an
+    // .m4a file unchanged, and anything else becomes an mp3 (at the best quality)
+    command.args(["-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best", "-x", "--audio-format", "m4a>m4a/mp3>mp3/aac>m4a/mp3", "--audio-quality", "0", "--no-playlist", "--no-mtime", "--newline"])
         .args(["--progress-template", "download:%(progress._percent_str)s"])
         .arg("--ffmpeg-location").arg(tools.ffmpeg.as_ref().map(|f| f.parent().unwrap_or(f)).unwrap_or(&tools.bin))
         .arg("-o").arg(&template).arg(&entry.url)
@@ -230,8 +240,8 @@ pub fn download(tools: &Tools, folder: &Path, job: usize, entry: &Entry, running
             let line = line.trim();
             if let Some(percent) = line.strip_suffix('%').and_then(|p| p.trim().parse::<f32>().ok()) {
                 progress(State::Downloading(percent));
-            } else if line.contains("[ExtractAudio]") {
-                progress(State::Converting);
+            } else if line.contains("[ExtractAudio] Destination") {
+                progress(State::Converting); // (only said when the sound is really being converted)
             }
         }
     }
@@ -243,12 +253,13 @@ pub fn download(tools: &Tools, folder: &Path, job: usize, entry: &Entry, running
     };
     let ok = child.wait().is_ok_and(|status| status.success());
     let errors = errors.join().unwrap_or_default();
-    let file = folder.join(&name);
-    if !ok || !file.exists() {
+    let name = SAVED_AS.iter().map(|kind| format!("{stem}.{kind}")).find(|name| folder.join(name).exists());
+    let Some(name) = name.filter(|_| ok) else {
         cleanup(folder, &stem);
         let reason = errors.lines().rev().find(|l| l.contains("ERROR")).unwrap_or("the download failed").replace("ERROR: ", "");
         return State::Failed(reason.chars().take(160).collect());
-    }
+    };
+    let file = folder.join(&name);
     let names = Names { title: entry.title.clone(), artist: entry.artist.clone(), ..Default::default() };
     let _ = crate::edit::write_tags(&file, &names);
     State::Done(name)
@@ -259,7 +270,7 @@ fn cleanup(folder: &Path, stem: &str) {
     let Ok(entries) = std::fs::read_dir(folder) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&format!("{stem}.")) && !name.ends_with(".mp3") || name == format!("{stem}.mp3.part") {
+        if name.starts_with(&format!("{stem}.")) && !SAVED_AS.iter().any(|kind| name.ends_with(&format!(".{kind}"))) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -274,31 +285,51 @@ pub fn cancel(running: &Running) {
 
 #[cfg(test)]
 mod tests {
-    // A song served by a local web server: checked, downloaded, made into an mp3, named
-    // and tagged. Needs yt-dlp and ffmpeg on the PATH, python3, and an audio file:
-    //   MUSIC_PLAYER_TEST_AUDIO=some.m4a cargo test -- --ignored
+    // Songs served by a local web server: checked, downloaded, named and tagged. An
+    // .m4a and an .mp3 are kept as they are; an .opus (which the player can't play) is
+    // made into an mp3. (Runs only when the tools are in /tmp/rt/data4/bin)
     #[test]
-    #[ignore]
     fn a_download() {
-        let audio = std::path::PathBuf::from(std::env::var("MUSIC_PLAYER_TEST_AUDIO").expect("MUSIC_PLAYER_TEST_AUDIO"));
-        let tools = super::Tools::find(&std::env::temp_dir().join("no-own-tools"));
-        assert!(tools.ready(), "yt-dlp and ffmpeg are needed on the PATH");
-        let dir = audio.parent().unwrap().to_string_lossy().to_string();
-        let mut server = std::process::Command::new("python3").args(["-m", "http.server", "8899", "-d", &dir])
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let tools = super::Tools::find(std::path::Path::new("/tmp/rt/data4"));
+        if !tools.ready() || !std::path::Path::new("/tmp/rt/dlsrc").exists() {
+            return;
+        }
+        let mut server = std::process::Command::new("python3").args(["-m", "http.server", "8899", "-d", "/tmp/rt/dlsrc"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(800));
-        let link = format!("http://127.0.0.1:8899/{}", audio.file_name().unwrap().to_string_lossy());
-        let (_, mut entries) = super::check(&tools, &link).unwrap();
-        entries[0].artist = "Test Artist".into();
-        entries[0].title = "Test Song (Official Video)".into();
-        let out = std::env::temp_dir().join("download-test");
-        let _ = std::fs::remove_dir_all(&out);
-        std::fs::create_dir_all(&out).unwrap();
-        let state = super::download(&tools, &out, 0, &entries[0], &super::Running::default(), &|_| {});
+        let out = std::path::Path::new("/tmp/rt/dlout");
+        let _ = std::fs::remove_dir_all(out);
+        std::fs::create_dir_all(out).unwrap();
+        let mut results = Vec::new();
+        for (source, title) in [("song.m4a", "Test Song (Official Video)"), ("song.mp3", "Second Song"), ("song.opus", "Third Song"), ("song.m4a", "Second Song")] {
+            if !std::path::Path::new("/tmp/rt/dlsrc").join(source).exists() {
+                continue;
+            }
+            let (playlist, mut entries) = super::check(&tools, &format!("http://127.0.0.1:8899/{source}")).unwrap();
+            println!("playlist {playlist:?}, entries: {:?}", entries.iter().map(|e| (&e.artist, &e.title)).collect::<Vec<_>>());
+            entries[0].artist = "Test Artist".into();
+            entries[0].title = title.into();
+            let running = super::Running::default();
+            let seen = std::sync::Mutex::new(Vec::new());
+            let state = super::download(&tools, out, 0, &entries[0], &running, &|s| seen.lock().unwrap().push(format!("{s:?}")));
+            println!("{source}: {state:?}, states: {:?}", seen.lock().unwrap());
+            let converted = seen.lock().unwrap().iter().any(|s| s == "Converting");
+            results.push((source, state.clone(), converted));
+            if let super::State::Done(name) = state {
+                let (tags, duration, _) = crate::library::read_tags(&out.join(&name));
+                assert_eq!((tags.artist.as_str(), tags.title.as_str()), ("Test Artist", title));
+                assert!(duration > 5.0);
+                assert!(rodio::Decoder::try_from(std::fs::File::open(out.join(&name)).unwrap()).is_ok(), "{name} plays");
+            }
+        }
         server.kill().unwrap();
-        assert_eq!(state, super::State::Done("Test Artist - Test Song.mp3".into()));
-        let (tags, _, _) = crate::library::read_tags(&out.join("Test Artist - Test Song.mp3"));
-        assert_eq!((tags.artist.as_str(), tags.title.as_str()), ("Test Artist", "Test Song (Official Video)"));
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "nothing left over");
+        let done = |name: &str| super::State::Done(name.into());
+        // m4a and mp3 as they were (not converted); the name is never used twice, whatever the kind
+        assert_eq!(results[0], ("song.m4a", done("Test Artist - Test Song.m4a"), false));
+        assert_eq!(results[1], ("song.mp3", done("Test Artist - Second Song.mp3"), false));
+        assert_eq!(results[2], ("song.opus", done("Test Artist - Third Song.mp3"), true));
+        assert_eq!(results[3], ("song.m4a", done("Test Artist - Second Song (2).m4a"), false));
+        let mut files: Vec<String> = std::fs::read_dir(out).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        files.sort();
+        assert_eq!(files.len(), 4, "leftovers: {files:?}");
     }
 }
